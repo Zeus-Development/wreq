@@ -1,5 +1,7 @@
 //! Proxy helpers
 
+// VIPER-PATCH(typed-proxy-errors): the public type of a failed connection.
+pub mod failure;
 #[cfg(feature = "socks")]
 pub mod socks;
 pub mod tunnel;

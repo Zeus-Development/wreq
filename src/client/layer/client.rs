@@ -1001,6 +1001,12 @@ impl Error {
         } else {
             kind
         };
+        // VIPER-PATCH(typed-proxy-errors): a ProxyFailure is a proxy error.
+        let kind = if error.is::<proxy::failure::ProxyFailure>() {
+            ErrorKind::ProxyConnect
+        } else {
+            kind
+        };
 
         Self {
             kind,

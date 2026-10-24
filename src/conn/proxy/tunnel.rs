@@ -4,11 +4,14 @@ use std::{
 };
 
 use bytes::BytesMut;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tower::{BoxError, Service};
 
-use super::Tunneling;
+use super::{
+    Tunneling,
+    failure::{ProxyFailure, ProxyFailureKind},
+};
 use crate::ext::UriExt;
 
 /// Tunnel Proxy via HTTP CONNECT
@@ -38,7 +41,28 @@ pub enum TunnelError {
     MissingHost,
     ProxyAuthRequired,
     TunnelUnexpectedEof,
-    TunnelUnsuccessful,
+    // VIPER-PATCH(typed-proxy-errors): the status is kept.
+    TunnelUnsuccessful(Option<StatusCode>),
+}
+
+// VIPER-PATCH(typed-proxy-errors): each tunnel error's kind.
+impl From<TunnelError> for ProxyFailure {
+    fn from(error: TunnelError) -> Self {
+        let kind = match error {
+            TunnelError::ConnectFailed(_) => ProxyFailureKind::Connect,
+            TunnelError::Io(_) => ProxyFailureKind::Handshake,
+            TunnelError::Parse(_) => ProxyFailureKind::Malformed,
+            TunnelError::ProxyAuthRequired => {
+                ProxyFailureKind::Status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+            }
+            TunnelError::TunnelUnexpectedEof => ProxyFailureKind::Closed,
+            TunnelError::TunnelUnsuccessful(Some(status)) => ProxyFailureKind::Status(status),
+            TunnelError::MissingHost | TunnelError::TunnelUnsuccessful(None) => {
+                ProxyFailureKind::Other
+            }
+        };
+        ProxyFailure::new(kind, error)
+    }
 }
 
 impl<C> TunnelConnector<C> {
@@ -191,7 +215,11 @@ where
             httparse::Status::Complete(_) => match res.code {
                 Some(200) => return Ok(conn),
                 Some(407) => return Err(TunnelError::ProxyAuthRequired),
-                Some(_) | None => return Err(TunnelError::TunnelUnsuccessful),
+                // VIPER-PATCH(typed-proxy-errors): the status is kept.
+                code => {
+                    let status = code.and_then(|code| StatusCode::from_u16(code).ok());
+                    return Err(TunnelError::TunnelUnsuccessful(status));
+                }
             },
         }
     }
@@ -206,7 +234,7 @@ impl std::fmt::Display for TunnelError {
             TunnelError::ProxyAuthRequired => "proxy authorization required",
             TunnelError::Parse(_) => "invalid proxy response",
             TunnelError::TunnelUnexpectedEof => "unexpected end of file",
-            TunnelError::TunnelUnsuccessful => "unsuccessful",
+            TunnelError::TunnelUnsuccessful(_) => "unsuccessful",
             TunnelError::ConnectFailed(_) => "failed to create underlying connection",
             TunnelError::Io(_) => "io error establishing tunnel",
         })

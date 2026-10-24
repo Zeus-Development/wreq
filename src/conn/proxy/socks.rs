@@ -12,7 +12,10 @@ use tokio_socks::{
 };
 use tower::Service;
 
-use super::Tunneling;
+use super::{
+    Tunneling,
+    failure::{ProxyFailure, ProxyFailureKind},
+};
 use crate::{
     dns::{DnsResolver, GaiResolver, Name, resolve},
     error::BoxError,
@@ -52,7 +55,49 @@ impl std::fmt::Display for SocksError {
     }
 }
 
-impl std::error::Error for SocksError {}
+// VIPER-PATCH(typed-proxy-errors): the cause is kept in the chain.
+impl std::error::Error for SocksError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConnectFailed(e) | Self::DnsResolveFailure(e) => Some(&**e),
+            Self::Socks(e) => Some(e),
+            Self::Io(e) => Some(e),
+            Self::Utf8(e) => Some(e),
+            Self::DnsFailure | Self::MissingHost => None,
+        }
+    }
+}
+
+// VIPER-PATCH(typed-proxy-errors): each SOCKS error's kind; the reply codes
+// of RFC 1928 section 6 by number.
+impl From<SocksError> for ProxyFailure {
+    fn from(error: SocksError) -> Self {
+        use tokio_socks::Error as E;
+        let kind = match &error {
+            SocksError::ConnectFailed(_) => ProxyFailureKind::Connect,
+            SocksError::Io(_) | SocksError::Socks(E::Io(_)) => ProxyFailureKind::Handshake,
+            SocksError::Socks(socks) => match socks {
+                E::GeneralSocksServerFailure => ProxyFailureKind::Socks5Reply(1),
+                E::ConnectionNotAllowedByRuleset => ProxyFailureKind::Socks5Reply(2),
+                E::NetworkUnreachable => ProxyFailureKind::Socks5Reply(3),
+                E::HostUnreachable => ProxyFailureKind::Socks5Reply(4),
+                E::ConnectionRefused => ProxyFailureKind::Socks5Reply(5),
+                E::TtlExpired => ProxyFailureKind::Socks5Reply(6),
+                E::CommandNotSupported => ProxyFailureKind::Socks5Reply(7),
+                E::AddressTypeNotSupported => ProxyFailureKind::Socks5Reply(8),
+                E::NoAcceptableAuthMethods => ProxyFailureKind::Socks5NoAcceptableMethods,
+                E::PasswordAuthFailure(status) => ProxyFailureKind::Socks5AuthRejected(*status),
+                E::InvalidResponseVersion
+                | E::UnknownAuthMethod
+                | E::InvalidReservedByte
+                | E::UnknownAddressType => ProxyFailureKind::Malformed,
+                _ => ProxyFailureKind::Other,
+            },
+            _ => ProxyFailureKind::Other,
+        };
+        ProxyFailure::new(kind, error)
+    }
+}
 
 impl From<std::io::Error> for SocksError {
     fn from(err: std::io::Error) -> Self {

@@ -325,6 +325,8 @@ pub mod tls;
 pub use self::client::multipart;
 #[cfg(feature = "ws")]
 pub use self::client::ws;
+// VIPER-PATCH(typed-proxy-errors): a failed connection through a proxy.
+pub use self::conn::proxy::failure::{ProxyFailure, ProxyFailureKind};
 pub use self::{
     client::{
         Client, ClientBuilder,

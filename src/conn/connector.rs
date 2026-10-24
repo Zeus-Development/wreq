@@ -372,7 +372,11 @@ impl TransportConnector {
                             socks.set_auth(proxy.raw_auth());
                             socks.set_version(version);
                             socks.set_dns_mode(dns_resolve);
-                            socks.call(uri).await?
+                            // VIPER-PATCH(typed-proxy-errors): typed.
+                            socks
+                                .call(uri)
+                                .await
+                                .map_err(proxy::failure::ProxyFailure::from)?
                         };
 
                         // Build an HTTPS connector.
@@ -416,7 +420,11 @@ impl TransportConnector {
                         }
 
                         // Connect to the proxy and establish the tunnel.
-                        tunnel.call(uri).await?
+                        // VIPER-PATCH(typed-proxy-errors): typed.
+                        tunnel
+                            .call(uri)
+                            .await
+                            .map_err(proxy::failure::ProxyFailure::from)?
                     };
 
                     // Wrap the established tunneled stream with TLS.
@@ -438,6 +446,11 @@ impl TransportConnector {
                 self.connect_auto_proxy(descriptor, proxy)
                     .await
                     .map_err(ProxyConnect)
+                    // VIPER-PATCH(typed-proxy-errors): typed.
+                    .map_err(|error| {
+                        let kind = proxy::failure::ProxyFailureKind::Connect;
+                        proxy::failure::ProxyFailure::new(kind, error)
+                    })
                     .map_err(Into::into)
             }
             #[cfg(unix)]
@@ -462,7 +475,11 @@ impl TransportConnector {
                         let mut tunnel =
                             proxy::tunnel::TunnelConnector::new(proxy_uri, connector.clone());
 
-                        tunnel.call(uri).await?
+                        // VIPER-PATCH(typed-proxy-errors): typed.
+                        tunnel
+                            .call(uri)
+                            .await
+                            .map_err(proxy::failure::ProxyFailure::from)?
                     };
 
                     // Wrap the established tunneled stream with TLS.
