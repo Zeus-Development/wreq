@@ -64,6 +64,8 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | --- | --- | --- | --- | --- | --- |
 | `typed-proxy-errors` | a failed connection through a proxy carries a public typed error, `ProxyFailure`, whose kind says what failed (the `CONNECT` status, each SOCKS5 reply code, the I/O error kept below it) | `adr:net-proxy-error-detail` | fork: `tests/viper_patches.rs`; Viper: `viper-net::proxy proxy_failures_fail_once_before_the_origin` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `verify-hook` | a caller's check of the server's certificate chain runs after the handshake's own verification and before any request byte, and a refused certificate is a public typed error, `CertificateRefused`, holding the verification result or the hook's error (RFC 5280 section 6, RFC 9525) | `adr:net-tls-verify-detail` | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_verifiers_refusal_fails_with_its_cause_before_any_request_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `proxy-alpn` | a proxy may carry an ALPN list (RFC 7301), offered in order on the TLS connection to an HTTPS proxy that tunnels with `CONNECT`; without one nothing is offered, as before | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 a_proxy_that_refuses_h2_gets_an_http1_tunnel` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `h2-proxy-connect` | when that proxy selects `h2`, each tunnel is a `CONNECT` stream of one HTTP/2 connection to the proxy, shared by the client's tunnels through it while it stays open (RFC 9113 section 8.5); another selection, or none, gets an HTTP/1.1 `CONNECT` on that connection | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 two_tunnels_share_one_http2_connection_to_the_proxy` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -105,6 +107,39 @@ succeeded is unchanged, and so is any failure with verification off (the
 library still verifies then, but its result never ends the handshake).
 Without a hook nothing else changes.
 
+## proxy-alpn
+
+wreq offered no ALPN on the TLS connection to an HTTPS proxy (the
+connector disabled it there), so a tunnel always spoke HTTP/1.1 to the
+proxy. With the patch, `Proxy::alpn_protocols` (`src/proxy.rs`) stores a
+list on the proxy, part of its identity like its credentials. The
+connector (`src/conn/connector.rs`) hands it to the TLS connector
+(`HttpsConnector::proxy_alpn`, `src/tls/conn.rs`), which offers it, in
+order, when it connects to the proxy's URI. It is used only for tunnels
+(`https` destinations): requests forwarded to the proxy for `http`
+destinations keep no ALPN and HTTP/1.1. Without a list nothing changes.
+
+## h2-proxy-connect
+
+wreq-proto's HTTP/2 client already sends `CONNECT` (an `:authority` and no
+`:scheme` or `:path`) and turns a 200 answer into an upgraded byte stream,
+but wreq's connector never used it for a proxy. With the patch
+(`src/conn/proxy/h2.rs`), a tunnel through an HTTPS proxy with an ALPN list
+first looks for an open HTTP/2 connection to the same proxy, then opens
+one: TLS with the list, and, when the proxy selected `h2`, the HTTP/2
+handshake with wreq-proto's default settings, the connection driven on the
+runtime's executor. Each tunnel is a `CONNECT` stream on it, carrying the
+proxy's credentials and headers; the destination's TLS runs inside the
+stream. A closed connection is dropped at the next lookup; two tunnels
+opened at the same moment may each open one. When the proxy selected
+another protocol or none, the HTTP/1.1 `CONNECT` runs on the connection
+just made (`TunnelConnector::tunnel_over`, `src/conn/proxy/tunnel.rs`).
+Failures are `ProxyFailure`s with the HTTP/1.1 tunnel's kinds: the
+connection to the proxy (`Connect`), an answer other than 200 (`Status`,
+407 included), and a stream or connection failure after the connection
+was made, such as a reset stream (`Handshake`, with the HTTP/2 error below
+it in the chain).
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -129,3 +164,4 @@ Without a hook nothing else changes.
 | --- | --- | --- |
 | V16d-3a | the last commit of this range | the branch and the patch `typed-proxy-errors` |
 | V16d-4 | the last commit of this range | the patch `verify-hook` |
+| V16d-3d | the last commit of this range | the patches `proxy-alpn` and `h2-proxy-connect` |
