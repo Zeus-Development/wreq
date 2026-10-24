@@ -77,9 +77,9 @@ chain of an error whose `is_proxy_connect` is true. Its kind is one of:
 in the chain), `Status` (the `CONNECT` answer's status, RFC 9110 section
 9.3.6), `Socks5Reply` (RFC 1928 section 6, 1 to 8),
 `Socks5NoAcceptableMethods` (RFC 1928 section 3), `Socks5AuthRejected`
-(RFC 1929), `Malformed`, `Closed` (the proxy ended the connection before
-its reply), `Handshake` (an I/O error during the handshake, below it in
-the chain) and `Other`. The SOCKS error keeps its cause as its source. The
+(RFC 1929), `Malformed`, `Closed` (the proxy ended the connection, an end
+of file, before its reply, for `CONNECT` and SOCKS5 alike), `Handshake`
+(another I/O error during the handshake, below it in the chain) and `Other`. The SOCKS error keeps its cause as its source. The
 wrapped errors' messages are unchanged; the forwarding proxy's connection
 failure (http origins) is wrapped too, as `Connect`.
 

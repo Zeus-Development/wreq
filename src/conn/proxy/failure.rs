@@ -28,8 +28,10 @@ pub struct ProxyFailure {
 pub enum ProxyFailureKind {
     /// The connection to the proxy itself failed.
     Connect,
-    /// The HTTP proxy answered `CONNECT` with this status, not 200 (RFC 9110
-    /// section 9.3.6); a 407 asks for credentials.
+    /// The HTTP proxy answered `CONNECT` with this status. wreq takes only a
+    /// 200 as an established tunnel, although RFC 9110 section 9.3.6 makes
+    /// any 2xx one, so another 2xx shows here too; a 407 asks for
+    /// credentials.
     Status(StatusCode),
     /// The SOCKS5 proxy's reply field, 1 to 8 (RFC 1928 section 6).
     Socks5Reply(u8),
@@ -41,10 +43,12 @@ pub enum ProxyFailureKind {
     Socks5AuthRejected(u8),
     /// The proxy's reply is not valid HTTP or SOCKS.
     Malformed,
-    /// The proxy ended the connection before its reply was complete.
+    /// The proxy ended the connection (an end of file) before its reply was
+    /// complete, for `CONNECT` and SOCKS5 alike.
     Closed,
-    /// An I/O error during the handshake with the proxy, after the
-    /// connection to it was made.
+    /// Another I/O error during the handshake with the proxy, after the
+    /// connection to it was made (such as a reset); the `io::Error` is below
+    /// it in the chain.
     Handshake,
     /// Any other failure, such as a destination without a host.
     Other,

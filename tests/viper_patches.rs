@@ -159,7 +159,7 @@ async fn socks5_authentication_failures_are_typed() {
 
 #[cfg(feature = "socks")]
 #[tokio::test]
-async fn a_socks5_proxy_that_closes_mid_handshake_is_a_handshake_failure() {
+async fn a_socks5_proxy_that_closes_mid_handshake_is_closed() {
     let address = proxy(|mut stream| async move {
         let mut greeting = [0; 3];
         stream.read_exact(&mut greeting).await.unwrap();
@@ -169,6 +169,6 @@ async fn a_socks5_proxy_that_closes_mid_handshake_is_a_handshake_failure() {
         "http://origin.test/",
     )
     .await;
-    assert_eq!(kind, ProxyFailureKind::Handshake);
+    assert_eq!(kind, ProxyFailureKind::Closed);
     assert_eq!(io, Some(io::ErrorKind::UnexpectedEof));
 }

@@ -12,6 +12,7 @@ use tokio_socks::{
 };
 use tower::Service;
 
+// VIPER-PATCH(typed-proxy-errors): the public failure type.
 use super::{
     Tunneling,
     failure::{ProxyFailure, ProxyFailureKind},
@@ -75,6 +76,11 @@ impl From<SocksError> for ProxyFailure {
         use tokio_socks::Error as E;
         let kind = match &error {
             SocksError::ConnectFailed(_) => ProxyFailureKind::Connect,
+            SocksError::Io(io) | SocksError::Socks(E::Io(io))
+                if io.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                ProxyFailureKind::Closed
+            }
             SocksError::Io(_) | SocksError::Socks(E::Io(_)) => ProxyFailureKind::Handshake,
             SocksError::Socks(socks) => match socks {
                 E::GeneralSocksServerFailure => ProxyFailureKind::Socks5Reply(1),

@@ -4,10 +4,12 @@ use std::{
 };
 
 use bytes::BytesMut;
+// VIPER-PATCH(typed-proxy-errors): StatusCode for the kept status.
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tower::{BoxError, Service};
 
+// VIPER-PATCH(typed-proxy-errors): the public failure type.
 use super::{
     Tunneling,
     failure::{ProxyFailure, ProxyFailureKind},
@@ -234,6 +236,7 @@ impl std::fmt::Display for TunnelError {
             TunnelError::ProxyAuthRequired => "proxy authorization required",
             TunnelError::Parse(_) => "invalid proxy response",
             TunnelError::TunnelUnexpectedEof => "unexpected end of file",
+            // VIPER-PATCH(typed-proxy-errors): the message is unchanged.
             TunnelError::TunnelUnsuccessful(_) => "unsuccessful",
             TunnelError::ConnectFailed(_) => "failed to create underlying connection",
             TunnelError::Io(_) => "io error establishing tunnel",
