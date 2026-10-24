@@ -23,6 +23,16 @@ use crate::{
 const AVERAGE_HEADER_SIZE: usize = 30;
 pub(crate) const DEFAULT_MAX_HEADERS: usize = 100;
 
+/// VIPER-PATCH(header-count-growth): the slots for parsing a response head
+/// again after it had more fields than `slots`: twice as many, up to the
+/// most fields `len` bytes can hold (a field takes at least three bytes: a
+/// name byte, the colon and a line feed); `None` when `slots` already holds
+/// that many.
+fn grown_slots(slots: usize, len: usize) -> Option<usize> {
+    let most = len / 3 + 1;
+    (slots < most).then(|| slots.saturating_mul(2).min(most))
+}
+
 macro_rules! header_name {
     ($bytes:expr) => {{
         {
@@ -117,18 +127,24 @@ impl Http1Transaction for Client {
     ) -> Result<Option<ParsedMessage<Self::Incoming>>, Parse> {
         debug_assert!(!buf.is_empty(), "parse called with empty buf");
 
+        // VIPER-PATCH(header-count-growth): the slot count once a head had
+        // more fields than the default slots; `None` until then.
+        let mut grown = None;
+
         // Loop to skip information status code headers (100 Continue, etc).
         loop {
+            // VIPER-PATCH(header-count-growth): the grown slots, once needed.
             let mut headers_indices: SmallVec<[MaybeUninit<HeaderIndices>; DEFAULT_MAX_HEADERS]> =
-                match ctx.h1_max_headers {
+                match grown.or(ctx.h1_max_headers) {
                     Some(cap) => smallvec![MaybeUninit::uninit(); cap],
                     None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
                 };
 
             let (len, status, reason, version, headers_len) = {
+                // VIPER-PATCH(header-count-growth): the grown slots, once needed.
                 let mut headers: SmallVec<
                     [MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS],
-                > = match ctx.h1_max_headers {
+                > = match grown.or(ctx.h1_max_headers) {
                     Some(cap) => smallvec![MaybeUninit::uninit(); cap],
                     None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
                 };
@@ -171,6 +187,16 @@ impl Http1Transaction for Client {
 
                         (0, StatusCode::OK, None, Version::HTTP_09, 0)
                     }
+                    // VIPER-PATCH(header-count-growth): RFC 9110 and RFC 9112 set
+                    // no limit on the number of fields, so unless the caller set
+                    // one (`max_headers`), a head with more fields than the slots
+                    // is parsed again with more; the read buffer's limit still
+                    // bounds the head's size.
+                    Err(httparse::Error::TooManyHeaders) if ctx.h1_max_headers.is_none() => {
+                        let slots = grown.unwrap_or(DEFAULT_MAX_HEADERS);
+                        grown = Some(grown_slots(slots, bytes.len()).ok_or(Parse::TooLarge)?);
+                        continue;
+                    }
                     Err(e) => return Err(e.into()),
                 }
             };
@@ -195,7 +221,11 @@ impl Http1Transaction for Client {
 
             let mut keep_alive = version == Version::HTTP_11;
 
-            headers.reserve(headers_len);
+            // VIPER-PATCH(header-count-growth): a head with more fields than a
+            // header map holds is too large, not a panic.
+            headers
+                .try_reserve(headers_len)
+                .map_err(|_| Parse::TooLarge)?;
             for header in &headers_indices[..headers_len] {
                 // SAFETY: array is valid up to `headers_len`
                 #[allow(unsafe_code)]
@@ -214,7 +244,10 @@ impl Http1Transaction for Client {
                     }
                 }
 
-                headers.append(name, value);
+                // VIPER-PATCH(header-count-growth): as for the reserve above.
+                headers
+                    .try_append(name, value)
+                    .map_err(|_| Parse::TooLarge)?;
             }
 
             let mut extensions = http::Extensions::default();
@@ -674,4 +707,66 @@ impl fmt::Write for FastWrite<'_> {
 #[inline]
 fn extend(dst: &mut Vec<u8>, data: &[u8]) {
     dst.extend_from_slice(data);
+}
+
+// VIPER-PATCH(header-count-growth): fork tests of a response head with more
+// fields than the default slots.
+#[cfg(test)]
+mod viper_patch_tests {
+    use super::*;
+
+    fn head(fields: usize) -> BytesMut {
+        let mut head = String::from("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n");
+        for n in 0..fields {
+            head.push_str(&format!("x-{n}: {n}\r\n"));
+        }
+        head.push_str("\r\n");
+        BytesMut::from(head.as_bytes())
+    }
+
+    fn parse(buf: &mut BytesMut, max_headers: Option<usize>) -> Result<usize, Parse> {
+        let (mut cached, mut method, mut informational) = (None, Some(Method::GET), None);
+        let ctx = ParseContext {
+            cached_headers: &mut cached,
+            req_method: &mut method,
+            h1_parser_config: &Default::default(),
+            h1_max_headers: max_headers,
+            h09_responses: false,
+            on_informational: &mut informational,
+        };
+        let parsed = Client::parse(buf, ctx)?.expect("a complete head");
+        Ok(parsed.head.headers.len())
+    }
+
+    #[test]
+    fn a_head_with_more_fields_than_the_default_slots_parses() {
+        for fields in [DEFAULT_MAX_HEADERS, 150, 5_000] {
+            let mut buf = head(fields);
+            assert_eq!(
+                parse(&mut buf, None).ok(),
+                Some(fields + 1),
+                "{fields} fields"
+            );
+            assert!(buf.is_empty(), "the whole head is read");
+        }
+    }
+
+    #[test]
+    fn the_slots_double_up_to_what_the_bytes_can_hold() {
+        assert_eq!(grown_slots(100, 3_000), Some(200));
+        assert_eq!(grown_slots(800, 3_000), Some(1_001));
+        assert_eq!(grown_slots(1_001, 3_000), None);
+    }
+
+    #[test]
+    fn more_fields_than_a_header_map_holds_fail_without_a_panic() {
+        let mut buf = head(30_000);
+        assert!(matches!(parse(&mut buf, None), Err(Parse::TooLarge)));
+    }
+
+    #[test]
+    fn a_count_set_by_the_caller_still_bounds_the_head() {
+        let mut buf = head(150);
+        assert!(matches!(parse(&mut buf, Some(100)), Err(Parse::TooLarge)));
+    }
 }
