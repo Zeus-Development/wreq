@@ -101,7 +101,9 @@ hook's error. A handshake that the library's own verification refused
 fails with `CertificateRefused` too, holding the verification result
 (`verify_error`) and the handshake error as its source; a handshake that
 failed before verifying (the result is `INVALID_CALL`) or after it
-succeeded is unchanged. Without a hook nothing else changes.
+succeeded is unchanged, and so is any failure with verification off (the
+library still verifies then, but its result never ends the handshake).
+Without a hook nothing else changes.
 
 ## Rebase procedure
 

@@ -8,7 +8,10 @@
 
 use std::{error::Error as StdError, fmt, sync::Arc};
 
-use btls::{ssl::SslRef, x509::X509VerifyError};
+use btls::{
+    ssl::{SslRef, SslVerifyMode},
+    x509::X509VerifyError,
+};
 use tower::BoxError;
 
 /// A caller's check of the server's certificate chain, run once per new TLS
@@ -47,8 +50,13 @@ impl CertificateRefused {
 
     /// The handshake error `source`, wrapped when the handshake's own
     /// verification failed on `ssl`; any other failure stays as it is. A
-    /// handshake that failed before verifying reports `INVALID_CALL`.
+    /// handshake that failed before verifying reports `INVALID_CALL`. With
+    /// verification off the library still verifies and keeps the result,
+    /// which then never ends the handshake, so a failure is unchanged.
     pub(crate) fn from_handshake(ssl: &SslRef, source: BoxError) -> BoxError {
+        if !ssl.verify_mode().contains(SslVerifyMode::PEER) {
+            return source;
+        }
         match ssl.verify_result() {
             Err(verify_error) if verify_error != X509VerifyError::INVALID_CALL => Box::new(Self {
                 verify_error: Some(verify_error),

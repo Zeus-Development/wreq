@@ -16,7 +16,7 @@ use btls::{
     hash::MessageDigest,
     nid::Nid,
     pkey::{PKey, Private},
-    ssl::{Ssl, SslContext, SslMethod},
+    ssl::{Ssl, SslContext, SslContextBuilder, SslMethod, SslVerifyMode, SslVersion},
     x509::{
         X509, X509Builder, X509NameBuilder, X509VerifyError,
         extension::{BasicConstraints, SubjectAlternativeName},
@@ -122,9 +122,18 @@ fn pki(days: (i64, i64)) -> Pki {
 /// leaf; it answers a request head with 200, and reports the bytes it
 /// received after its handshake (`None` when the handshake failed).
 async fn origin(pki: &Pki) -> (String, oneshot::Receiver<Option<usize>>) {
+    origin_with(pki, |_| {}).await
+}
+
+/// [`origin`], with `configure` applied to its TLS context.
+async fn origin_with(
+    pki: &Pki,
+    configure: impl FnOnce(&mut SslContextBuilder),
+) -> (String, oneshot::Receiver<Option<usize>>) {
     let mut context = SslContext::builder(SslMethod::tls()).unwrap();
     context.set_private_key(&pki.leaf_key).unwrap();
     context.set_certificate(&pki.leaf).unwrap();
+    configure(&mut context);
     let context = context.build();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -245,4 +254,35 @@ async fn the_handshakes_own_refusal_keeps_its_verify_result() {
     let error = client(&other, &hook).get(&url).send().await.unwrap_err();
     let unknown = X509VerifyError::UNABLE_TO_GET_ISSUER_CERT_LOCALLY;
     assert_eq!(refusal(&error).verify_error(), Some(unknown));
+}
+
+/// With verification off the library still verifies and keeps the result;
+/// a handshake that then fails for another reason (a TLS 1.2 origin that
+/// demands a client certificate the client does not have) is not a refused
+/// certificate.
+#[tokio::test]
+async fn with_verification_off_another_failure_is_not_a_refused_certificate() {
+    let (pki, other) = (pki((-1, 30)), pki((-1, 30)));
+    let (url, received) = origin_with(&pki, |context| {
+        context
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .unwrap();
+        context.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+    })
+    .await;
+    let store = CertStore::builder()
+        .add_der_cert(&other.ca.to_der().unwrap())
+        .build()
+        .unwrap();
+    let client = Client::builder()
+        .tls_cert_store(store)
+        .tls_cert_verification(false)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let error = client.get(&url).send().await.unwrap_err();
+    let top: &(dyn std::error::Error + 'static) = &error;
+    let mut chain = std::iter::successors(Some(top), |&e| e.source());
+    assert!(!chain.any(|e| e.is::<CertificateRefused>()), "{error:?}");
+    assert_eq!(received.await.unwrap(), None);
 }
