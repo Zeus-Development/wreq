@@ -13,7 +13,8 @@ use std::{path::Path, sync::Arc};
 
 use http::{HeaderMap, Uri, header::HeaderValue};
 
-use crate::{IntoUri, ext::UriExt};
+// VIPER-PATCH(proxy-alpn): the protocols offered to an HTTPS proxy.
+use crate::{IntoUri, ext::UriExt, tls::AlpnProtocol};
 
 // # Internals
 //
@@ -99,6 +100,8 @@ enum ProxyScheme {
 struct Extra {
     auth: Option<HeaderValue>,
     misc: Option<HeaderMap>,
+    // VIPER-PATCH(proxy-alpn): `None` offers no ALPN to the proxy.
+    alpn: Option<Vec<AlpnProtocol>>,
 }
 
 // ===== impl Proxy =====
@@ -185,6 +188,8 @@ impl Proxy {
             extra: Extra {
                 auth: None,
                 misc: None,
+                // VIPER-PATCH(proxy-alpn): none by default.
+                alpn: None,
             },
             scheme,
             no_proxy: None,
@@ -268,6 +273,23 @@ impl Proxy {
             }
         }
 
+        self
+    }
+
+    // VIPER-PATCH(proxy-alpn): the proxy's ALPN list.
+    /// Sets the protocols offered through ALPN (RFC 7301) on the TLS
+    /// connection to an HTTPS proxy that tunnels with `CONNECT`, in order of
+    /// preference. By default none is offered and the tunnel speaks
+    /// HTTP/1.1.
+    ///
+    /// When the proxy selects `h2`, each tunnel is a `CONNECT` stream of one
+    /// HTTP/2 connection to the proxy (RFC 9113 section 8.5), shared by the
+    /// client's tunnels through this proxy while it stays open; when it
+    /// selects another protocol or none, the tunnel is an HTTP/1.1
+    /// `CONNECT` on that connection. Requests forwarded to the proxy for
+    /// `http` destinations are unchanged: no ALPN, HTTP/1.1.
+    pub fn alpn_protocols(mut self, protocols: &[AlpnProtocol]) -> Proxy {
+        self.extra.alpn = Some(protocols.to_vec());
         self
     }
 
@@ -397,6 +419,8 @@ impl Hash for Extra {
         } else {
             1u8.hash(state);
         }
+        // VIPER-PATCH(proxy-alpn): part of the proxy's identity.
+        self.alpn.hash(state);
     }
 }
 

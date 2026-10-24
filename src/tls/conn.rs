@@ -86,6 +86,8 @@ pub struct TlsConnector {
     settings: HandshakeSettings,
     // VIPER-PATCH(verify-hook): run after each handshake.
     verify_hook: Option<crate::tls::verify::CertVerifyHookRef>,
+    // VIPER-PATCH(proxy-alpn): the encoded list offered to a proxy.
+    proxy_alpn: Option<bytes::Bytes>,
 }
 
 // ===== impl HttpsConnector =====
@@ -107,6 +109,13 @@ where
     #[inline]
     pub fn no_alpn(&mut self) -> &mut Self {
         self.tls.settings.alpn_protocols = None;
+        self
+    }
+
+    // VIPER-PATCH(proxy-alpn): offered when this connector is called with
+    // the proxy's URI, which sets no ALPN otherwise.
+    pub(crate) fn proxy_alpn(&mut self, protocols: &[AlpnProtocol]) -> &mut Self {
+        self.tls.proxy_alpn = Some(AlpnProtocol::encode_sequence(protocols));
         self
     }
 }
@@ -133,7 +142,11 @@ impl TlsConnector {
     }
 
     fn setup_ssl(&self, uri: Uri) -> Result<Ssl, BoxError> {
-        let cfg = self.ssl.configure()?;
+        // VIPER-PATCH(proxy-alpn): the proxy's list, when one is set.
+        let mut cfg = self.ssl.configure()?;
+        if let Some(protocols) = &self.proxy_alpn {
+            cfg.set_alpn_protos(protocols)?;
+        }
         let host = uri.host().ok_or("URI missing host")?;
         let host = Self::normalize_host(host);
         let ssl = cfg.into_ssl(host)?;
@@ -484,6 +497,8 @@ impl TlsConnectorBuilder {
             settings,
             // VIPER-PATCH(verify-hook): run after each handshake.
             verify_hook: self.verify_hook.clone(),
+            // VIPER-PATCH(proxy-alpn): set per call by the connector.
+            proxy_alpn: None,
         })
     }
 }

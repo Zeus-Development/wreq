@@ -2,6 +2,8 @@
 
 // VIPER-PATCH(typed-proxy-errors): the public type of a failed connection.
 pub mod failure;
+// VIPER-PATCH(h2-proxy-connect): tunnels as HTTP/2 CONNECT streams.
+pub(crate) mod h2;
 #[cfg(feature = "socks")]
 pub mod socks;
 pub mod tunnel;

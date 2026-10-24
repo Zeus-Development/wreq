@@ -124,6 +124,16 @@ impl<C> TunnelConnector<C> {
 
         self
     }
+
+    // VIPER-PATCH(h2-proxy-connect): an HTTP/1.1 `CONNECT` on a connection
+    // to the proxy already made (one that did not select `h2`).
+    pub(crate) async fn tunnel_over<T>(&self, conn: T, dst: &Uri) -> Result<T, TunnelError>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        let host = dst.host().ok_or(TunnelError::MissingHost)?;
+        tunnel(conn, host, dst.port_or_default(), &self.headers).await
+    }
 }
 
 impl<C> Service<Uri> for TunnelConnector<C>

@@ -49,6 +49,8 @@ struct Config {
     verbose: Verbose,
     nodelay: bool,
     tls_info: bool,
+    // VIPER-PATCH(h2-proxy-connect): the open HTTP/2 proxy connections.
+    h2_proxies: proxy::h2::Shared,
 }
 
 /// Assembles the transport service graph used by a client.
@@ -102,6 +104,8 @@ impl ConnectorBuilder {
                 verbose: Verbose::OFF,
                 nodelay: true,
                 tls_info: false,
+                // VIPER-PATCH(h2-proxy-connect): none open yet.
+                h2_proxies: Default::default(),
             },
             timer: Timer::default(),
             timeout: None,
@@ -404,6 +408,10 @@ impl TransportConnector {
                     // Build an HTTPS connector.
                     let mut connector = self.build_https_connector(is_https, &descriptor)?;
 
+                    // VIPER-PATCH(h2-proxy-connect): an HTTPS proxy given an
+                    // ALPN list may tunnel over HTTP/2.
+                    let h2_alpn = proxy.alpn().filter(|_| proxy_uri.is_https());
+
                     // Build a tunnel connector to establish the CONNECT tunnel.
                     let tunneled = {
                         let mut tunnel =
@@ -419,12 +427,31 @@ impl TransportConnector {
                             tunnel = tunnel.with_headers(headers.clone());
                         }
 
-                        // Connect to the proxy and establish the tunnel.
-                        // VIPER-PATCH(typed-proxy-errors): typed.
-                        tunnel
-                            .call(uri)
-                            .await
-                            .map_err(proxy::failure::ProxyFailure::from)?
+                        // VIPER-PATCH(h2-proxy-connect): a CONNECT stream, else
+                        // HTTP/1.1 on the connection made with the list.
+                        if let Some(alpn) = h2_alpn {
+                            let shared = &self.config.h2_proxies;
+                            let opened =
+                                proxy::h2::open(shared, &proxy, alpn, connector.clone(), &uri);
+                            match opened.await.map_err(proxy::failure::ProxyFailure::from)? {
+                                proxy::h2::Opened::Stream(stream) => {
+                                    let conn = EstablishedConn::new(stream, descriptor);
+                                    let io = connector.call(conn).await?;
+                                    return self.tunnel_conn_from_stream(io);
+                                }
+                                proxy::h2::Opened::Http1(conn) => tunnel
+                                    .tunnel_over(conn, &uri)
+                                    .await
+                                    .map_err(proxy::failure::ProxyFailure::from)?,
+                            }
+                        } else {
+                            // Connect to the proxy and establish the tunnel.
+                            // VIPER-PATCH(typed-proxy-errors): typed.
+                            tunnel
+                                .call(uri)
+                                .await
+                                .map_err(proxy::failure::ProxyFailure::from)?
+                        }
                     };
 
                     // Wrap the established tunneled stream with TLS.

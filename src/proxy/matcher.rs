@@ -27,7 +27,8 @@ use percent_encoding::percent_decode_str;
 
 use self::builder::IntoValue;
 use super::{Extra, Intercepted};
-use crate::ext::UriExt;
+// VIPER-PATCH(proxy-alpn): the type of the proxy's ALPN list.
+use crate::{ext::UriExt, tls::AlpnProtocol};
 
 /// A proxy matcher, usually built from environment variables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -163,6 +164,12 @@ impl Intercept {
     #[inline]
     pub(crate) fn custom_headers(&self) -> Option<&HeaderMap> {
         self.extra.misc.as_ref()
+    }
+
+    // VIPER-PATCH(proxy-alpn): the list set on the proxy.
+    #[inline]
+    pub(crate) fn alpn(&self) -> Option<&[AlpnProtocol]> {
+        self.extra.alpn.as_deref()
     }
 
     #[cfg(feature = "socks")]
