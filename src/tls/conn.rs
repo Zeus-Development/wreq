@@ -74,6 +74,8 @@ pub struct TlsConnectorBuilder {
     cert_verification: bool,
     keylog: Option<KeyLog>,
     session_cache: Arc<dyn TlsSessionCache>,
+    // VIPER-PATCH(verify-hook): the caller's certificate check.
+    verify_hook: Option<crate::tls::verify::CertVerifyHookRef>,
 }
 
 /// A layer which wraps services in an `SslConnector`.
@@ -82,6 +84,8 @@ pub struct TlsConnector {
     ssl: SslConnector,
     cache: Option<Arc<dyn TlsSessionCache>>,
     settings: HandshakeSettings,
+    // VIPER-PATCH(verify-hook): run after each handshake.
+    verify_hook: Option<crate::tls::verify::CertVerifyHookRef>,
 }
 
 // ===== impl HttpsConnector =====
@@ -123,6 +127,8 @@ impl TlsConnector {
             cert_verification: true,
             keylog: None,
             session_cache: Arc::new(LruTlsSessionCache::new(8)),
+            // VIPER-PATCH(verify-hook): none by default.
+            verify_hook: None,
         }
     }
 
@@ -306,6 +312,14 @@ impl TlsConnectorBuilder {
         self
     }
 
+    // VIPER-PATCH(verify-hook): the caller's certificate check.
+    /// Sets the check run on the server's chain after each handshake.
+    #[inline]
+    pub fn verify_hook(mut self, hook: Option<crate::tls::verify::CertVerifyHookRef>) -> Self {
+        self.verify_hook = hook;
+        self
+    }
+
     /// Sets a custom TLS session store.
     #[inline]
     pub fn session_store(mut self, store: Option<Arc<dyn TlsSessionCache>>) -> Self {
@@ -468,6 +482,8 @@ impl TlsConnectorBuilder {
             ssl: connector.build(),
             cache,
             settings,
+            // VIPER-PATCH(verify-hook): run after each handshake.
+            verify_hook: self.verify_hook.clone(),
         })
     }
 }

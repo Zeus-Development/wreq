@@ -8,6 +8,8 @@ pub mod compress;
 pub mod keylog;
 pub mod session;
 pub mod trust;
+// VIPER-PATCH(verify-hook): the caller's certificate check.
+pub mod verify;
 
 use std::borrow::Cow;
 

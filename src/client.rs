@@ -217,6 +217,8 @@ struct Config {
     tls_identity: Option<Identity>,
     tls_cert_store: Option<CertStore>,
     tls_cert_verification: bool,
+    // VIPER-PATCH(verify-hook): the caller's certificate check.
+    tls_verify_hook: Option<crate::tls::verify::CertVerifyHookRef>,
     tls_verify_hostname: bool,
     tls_min_version: Option<TlsVersion>,
     tls_max_version: Option<TlsVersion>,
@@ -306,6 +308,8 @@ impl Client {
                 tls_identity: None,
                 tls_cert_store: None,
                 tls_cert_verification: true,
+                // VIPER-PATCH(verify-hook): none by default.
+                tls_verify_hook: None,
                 tls_verify_hostname: true,
                 tls_min_version: None,
                 tls_max_version: None,
@@ -524,6 +528,8 @@ impl ClientBuilder {
                     .tls_sni(config.tls_sni)
                     .verify_hostname(config.tls_verify_hostname)
                     .cert_verification(config.tls_cert_verification)
+                    // VIPER-PATCH(verify-hook): run after each handshake.
+                    .verify_hook(config.tls_verify_hook)
                     .session_store(config.tls_session_cache)
                 })
                 .with_http(|http| {
@@ -1437,6 +1443,17 @@ impl ClientBuilder {
     #[inline]
     pub fn tls_cert_verification(mut self, cert_verification: bool) -> ClientBuilder {
         self.config.tls_cert_verification = cert_verification;
+        self
+    }
+
+    // VIPER-PATCH(verify-hook): the caller's certificate check.
+    /// Sets a check of the server's certificate chain, run after each TLS
+    /// handshake (and its own verification) and before the connection
+    /// carries any request byte. Its error refuses the connection: the
+    /// request fails with a [`crate::tls::verify::CertificateRefused`].
+    #[inline]
+    pub fn tls_verify_hook(mut self, hook: crate::tls::verify::CertVerifyHookRef) -> ClientBuilder {
+        self.config.tls_verify_hook = Some(hook);
         self
     }
 

@@ -10,20 +10,40 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_btls::SslStream;
 use tower::{BoxError, Service};
 
-use super::{EstablishedConn, HttpsConnector, MaybeHttpsStream};
+// VIPER-PATCH(verify-hook): the hook's error type.
+use super::{EstablishedConn, HttpsConnector, MaybeHttpsStream, TlsConnector};
 use crate::{
     conn::{Connection, descriptor::ConnectionDescriptor},
     ext::UriExt,
+    tls::verify::CertificateRefused, // VIPER-PATCH(verify-hook)
 };
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
-async fn perform_handshake<T>(ssl: btls::ssl::Ssl, conn: T) -> Result<MaybeHttpsStream<T>, BoxError>
+// VIPER-PATCH(verify-hook): a refused certificate keeps the verification
+// result, and the caller's hook checks the chain for `uri`'s host before
+// the stream is handed out, so before any request byte.
+async fn perform_handshake<T>(
+    tls: &TlsConnector,
+    ssl: btls::ssl::Ssl,
+    conn: T,
+    uri: &Uri,
+) -> Result<MaybeHttpsStream<T>, BoxError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut stream = SslStream::new(ssl, conn)?;
-    Pin::new(&mut stream).connect().await?;
+    // VIPER-PATCH(verify-hook): the verification result of a refusal.
+    if let Err(error) = Pin::new(&mut stream).connect().await {
+        return Err(CertificateRefused::from_handshake(
+            stream.ssl(),
+            error.into(),
+        ));
+    }
+    if let Some(hook) = &tls.verify_hook {
+        let host = TlsConnector::normalize_host(uri.host().unwrap_or_default());
+        CertificateRefused::check(hook.as_ref(), stream.ssl(), host)?;
+    }
     Ok(MaybeHttpsStream::Https(stream))
 }
 
@@ -55,8 +75,9 @@ where
                 return Ok(MaybeHttpsStream::Http(conn));
             }
 
-            let ssl = tls.setup_ssl(uri)?;
-            perform_handshake(ssl, conn).await
+            // VIPER-PATCH(verify-hook): the host goes to the hook.
+            let ssl = tls.setup_ssl(uri.clone())?;
+            perform_handshake(&tls, ssl, conn, &uri).await
         };
 
         Box::pin(f)
@@ -93,7 +114,8 @@ where
             }
 
             let ssl = tls.setup_ssl2(descriptor)?;
-            perform_handshake(ssl, conn).await
+            // VIPER-PATCH(verify-hook): the host goes to the hook.
+            perform_handshake(&tls, ssl, conn, &uri).await
         };
 
         Box::pin(f)
@@ -125,8 +147,11 @@ where
                 return Ok(MaybeHttpsStream::Http(conn.io));
             }
 
+            // VIPER-PATCH(verify-hook): the host goes to the hook.
+            let uri = conn.descriptor.uri().clone();
             let ssl = tls.setup_ssl2(conn.descriptor)?;
-            perform_handshake(ssl, conn.io).await
+            // VIPER-PATCH(verify-hook): the host goes to the hook.
+            perform_handshake(&tls, ssl, conn.io, &uri).await
         };
 
         Box::pin(fut)
