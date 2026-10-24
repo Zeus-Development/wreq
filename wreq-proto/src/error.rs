@@ -78,6 +78,9 @@ pub(crate) enum Parse {
 pub(crate) enum Header {
     Token,
     ContentLengthInvalid,
+    // VIPER-PATCH(content-length-values): every value is a number, and they
+    // differ.
+    ContentLengthDiffer,
     TransferEncodingUnexpected,
 }
 
@@ -115,6 +118,17 @@ impl Error {
     #[inline]
     pub fn is_parse_status(&self) -> bool {
         matches!(self.inner.kind, Kind::Parse(Parse::Status))
+    }
+
+    /// VIPER-PATCH(content-length-values): returns true if this was an HTTP
+    /// parse error caused by `Content-Length` values that are all numbers
+    /// but differ (RFC 9112 section 6.3), not by an unreadable value.
+    #[inline]
+    pub fn is_parse_content_length_differ(&self) -> bool {
+        matches!(
+            self.inner.kind,
+            Kind::Parse(Parse::Header(Header::ContentLengthDiffer))
+        )
     }
 
     /// Returns true if this error was caused by user code.
@@ -295,6 +309,10 @@ impl Error {
             Kind::Parse(Parse::Header(Header::ContentLengthInvalid)) => {
                 "invalid content-length parsed"
             }
+            // VIPER-PATCH(content-length-values): its own message.
+            Kind::Parse(Parse::Header(Header::ContentLengthDiffer)) => {
+                "differing content-length values parsed"
+            }
             Kind::Parse(Parse::Header(Header::TransferEncodingUnexpected)) => {
                 "unexpected transfer-encoding parsed"
             }
@@ -364,6 +382,12 @@ impl Parse {
     #[inline]
     pub(crate) fn content_length_invalid() -> Self {
         Parse::Header(Header::ContentLengthInvalid)
+    }
+
+    // VIPER-PATCH(content-length-values): differing values.
+    #[inline]
+    pub(crate) fn content_length_differ() -> Self {
+        Parse::Header(Header::ContentLengthDiffer)
     }
 
     #[inline]

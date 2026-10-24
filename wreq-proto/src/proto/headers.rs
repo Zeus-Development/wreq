@@ -57,6 +57,24 @@ pub(super) fn content_length_parse_all_values(values: ValueIter<'_, HeaderValue>
     content_length
 }
 
+/// VIPER-PATCH(content-length-values): whether every `Content-Length` value
+/// is a number and they are not all the same.
+pub(super) fn content_length_values_differ(headers: &HeaderMap) -> bool {
+    let (mut first, mut differ) = (None, false);
+    for value in headers.get_all(CONTENT_LENGTH) {
+        let Ok(line) = value.to_str() else {
+            return false;
+        };
+        for v in line.split(',') {
+            let Some(n) = from_digits(v.trim().as_bytes()) else {
+                return false;
+            };
+            differ |= *first.get_or_insert(n) != n;
+        }
+    }
+    differ
+}
+
 fn from_digits(bytes: &[u8]) -> Option<u64> {
     // cannot use FromStr for u64, since it allows a signed prefix
     let mut result = 0u64;

@@ -414,6 +414,13 @@ impl Client {
             return Ok(Some((DecodedLength::checked_new(len)?, false)));
         }
 
+        // VIPER-PATCH(content-length-values): differing values (RFC 9112
+        // section 6.3) are told apart from an unreadable value.
+        if headers::content_length_values_differ(&inc.headers) {
+            debug!("differing Content-Length values");
+            return Err(Parse::content_length_differ());
+        }
+
         if inc.headers.contains_key(header::CONTENT_LENGTH) {
             debug!("illegal Content-Length header");
             return Err(Parse::content_length_invalid());
@@ -768,5 +775,48 @@ mod viper_patch_tests {
     fn a_count_set_by_the_caller_still_bounds_the_head() {
         let mut buf = head(150);
         assert!(matches!(parse(&mut buf, Some(100)), Err(Parse::TooLarge)));
+    }
+}
+
+// VIPER-PATCH(content-length-values): fork tests of differing Content-Length
+// values told apart from an unreadable one.
+#[cfg(test)]
+mod viper_content_length_tests {
+    use super::*;
+
+    fn failure(fields: &str) -> Option<String> {
+        let head = format!("HTTP/1.1 200 OK\r\n{fields}\r\n");
+        let mut buf = BytesMut::from(head.as_bytes());
+        let (mut cached, mut method, mut informational) = (None, Some(Method::GET), None);
+        let ctx = ParseContext {
+            cached_headers: &mut cached,
+            req_method: &mut method,
+            h1_parser_config: &Default::default(),
+            h1_max_headers: None,
+            h09_responses: false,
+            on_informational: &mut informational,
+        };
+        Client::parse(&mut buf, ctx)
+            .err()
+            .map(|parse| Error::from(parse).to_string())
+    }
+
+    #[test]
+    fn differing_content_length_values_have_their_own_error() {
+        let differing = "differing content-length values parsed";
+        for fields in [
+            "content-length: 1\r\ncontent-length: 2\r\n",
+            "content-length: 1, 2\r\n",
+        ] {
+            assert_eq!(failure(fields).as_deref(), Some(differing), "{fields:?}");
+        }
+        let invalid = "invalid content-length parsed";
+        for fields in [
+            "content-length: x\r\n",
+            "content-length: 1\r\ncontent-length: x\r\n",
+        ] {
+            assert_eq!(failure(fields).as_deref(), Some(invalid), "{fields:?}");
+        }
+        assert_eq!(failure("content-length: 1\r\ncontent-length: 1\r\n"), None);
     }
 }
