@@ -63,6 +63,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | Id | Reason | Register entry | Tests | Licence and upstream attribution | Upstream status |
 | --- | --- | --- | --- | --- | --- |
 | `typed-proxy-errors` | a failed connection through a proxy carries a public typed error, `ProxyFailure`, whose kind says what failed (the `CONNECT` status, each SOCKS5 reply code, the I/O error kept below it) | `adr:net-proxy-error-detail` | fork: `tests/viper_patches.rs`; Viper: `viper-net::proxy proxy_failures_fail_once_before_the_origin` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `verify-hook` | a caller's check of the server's certificate chain runs after the handshake's own verification and before any request byte, and a refused certificate is a public typed error, `CertificateRefused`, holding the verification result or the hook's error (RFC 5280 section 6, RFC 9525) | `adr:net-tls-verify-detail` | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_verifiers_refusal_fails_with_its_cause_before_any_request_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -82,6 +83,25 @@ of file, before its reply, for `CONNECT` and SOCKS5 alike), `Handshake`
 (another I/O error during the handshake, below it in the chain) and `Other`. The SOCKS error keeps its cause as its source. The
 wrapped errors' messages are unchanged; the forwarding proxy's connection
 failure (http origins) is wrapped too, as `Connect`.
+
+## verify-hook
+
+wreq verified a server's certificate only through the TLS library's own
+chain and name verification, offered no hook between the handshake and the
+first request byte, and dropped the handshake's state on failure, so a
+caller could neither add its own check nor tell why a certificate was
+refused. With the patch, `ClientBuilder::tls_verify_hook` takes a
+`CertVerifyHook` (`src/tls/verify.rs`, public as
+`wreq::tls::verify`), which the TLS connector (`src/tls/conn/service.rs`)
+calls once per new connection, a resumed one included, after the handshake
+succeeded and before the stream is handed out, with the peer's chain in
+DER (the leaf first, as sent) and the host the connection was made for. Its
+error refuses the connection with `CertificateRefused`, whose source is the
+hook's error. A handshake that the library's own verification refused
+fails with `CertificateRefused` too, holding the verification result
+(`verify_error`) and the handshake error as its source; a handshake that
+failed before verifying (the result is `INVALID_CALL`) or after it
+succeeded is unchanged. Without a hook nothing else changes.
 
 ## Rebase procedure
 
@@ -106,3 +126,4 @@ failure (http origins) is wrapped too, as `Connect`.
 | Viper task | Commit | Change |
 | --- | --- | --- |
 | V16d-3a | the last commit of this range | the branch and the patch `typed-proxy-errors` |
+| V16d-4 | the last commit of this range | the patch `verify-hook` |
