@@ -66,6 +66,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `verify-hook` | a caller's check of the server's certificate chain runs after the handshake's own verification and before any request byte, and a refused certificate is a public typed error, `CertificateRefused`, holding the verification result or the hook's error (RFC 5280 section 6, RFC 9525) | `adr:net-tls-verify-detail` | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_verifiers_refusal_fails_with_its_cause_before_any_request_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `proxy-alpn` | a proxy may carry an ALPN list (RFC 7301), offered in order on the TLS connection to an HTTPS proxy that tunnels with `CONNECT`; without one nothing is offered, as before | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 a_proxy_that_refuses_h2_gets_an_http1_tunnel` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `h2-proxy-connect` | when that proxy selects `h2`, each tunnel is a `CONNECT` stream of one HTTP/2 connection to the proxy, shared by the client's tunnels through it while it stays open (RFC 9113 section 8.5); another selection, or none, gets an HTTP/1.1 `CONNECT` on that connection | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 two_tunnels_share_one_http2_connection_to_the_proxy` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `connection-reuse` | a request that failed on a connection checked out of the pool says so (`Error::is_connection_reused`), and a request may ask for a new connection instead of an idle one (`RequestBuilder::new_connection`), so a client can send an idempotent request again on a new connection after its connection closed before the response (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_connection_reuse.rs`; Viper: `viper-net::resend a_reused_connection_closed_before_the_response_is_sent_again` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -140,6 +141,25 @@ connection to the proxy (`Connect`), an answer other than 200 (`Status`,
 was made, such as a reset stream (`Handshake`, with the HTTP/2 error below
 it in the chain).
 
+## connection-reuse
+
+wreq retried a request only when it was never written to its connection
+(`retry_canceled_requests`, on a reused connection). A request that was
+written to a pooled connection the peer had closed while it was idle failed
+with the pool's `is_reused()` dropped, and every request checked out an
+idle connection first, so a caller could neither tell such a failure apart
+nor make sure a second attempt went to a new connection. With the patch,
+the client layer's error (`src/client/layer/client.rs`) keeps whether the
+failed request's connection came out of the pool, read through
+`wreq::Error::is_connection_reused` (`src/error.rs`), and
+`RequestBuilder::new_connection` (`src/client/request.rs`, a per-request
+option in `src/client/layer/config.rs`) makes the client connect instead
+of checking out an idle connection; the new connection joins the pool as
+usual. While another HTTP/2 connection to the destination is being made,
+such a request waits for that one, which is new too. Nothing else changes:
+a request without the option uses the pool as before, and wreq's own
+retries are unchanged.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -165,3 +185,4 @@ it in the chain).
 | V16d-3a | the last commit of this range | the branch and the patch `typed-proxy-errors` |
 | V16d-4 | the last commit of this range | the patch `verify-hook` |
 | V16d-3d | the last commit of this range | the patches `proxy-alpn` and `h2-proxy-connect` |
+| NET-RESEND-1 | the last commit of this range | the patch `connection-reuse` |
