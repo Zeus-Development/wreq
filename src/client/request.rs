@@ -797,9 +797,11 @@ impl RequestBuilder {
     // retransmit a request on a new connection after its connection closed
     // prematurely; this asks for one.
     /// Sends this request on a new connection rather than on an idle one
-    /// from the pool. The new connection joins the pool as usual. While
-    /// another HTTP/2 connection to the same destination is being made, the
-    /// request uses that one, which is new too.
+    /// from the pool. Over HTTP/1 the new connection then joins the pool as
+    /// usual. Over HTTP/2 the pool keeps one connection per destination:
+    /// the new connection joins it only when none is idle, and while another
+    /// HTTP/2 connection to the destination is being made, the request may
+    /// use that one or the pooled one, and is then reported as reused.
     pub fn new_connection(mut self, new_connection: bool) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             req.config_mut::<RequestOptions>()

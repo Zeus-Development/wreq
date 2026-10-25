@@ -418,10 +418,12 @@ where
         }
 
         // VIPER-PATCH(connection-reuse): a request that asks for a new
-        // connection skips the idle ones (RFC 9112 section 9.3.1); the new
-        // connection joins the pool as usual. While another HTTP/2
-        // connection to the destination is being made, the request waits
-        // for that one below, which is new too.
+        // connection skips the idle ones (RFC 9112 section 9.3.1); over
+        // HTTP/1 the new connection joins the pool as usual. Over HTTP/2 the
+        // pool keeps one connection per destination, so it joins only when
+        // none is idle, and while another HTTP/2 connection to the
+        // destination is being made the request falls back to the race
+        // below, which may give it that one or the pooled one (reused).
         if self.config.new_connection {
             match self.connect_to(descriptor.clone()).await {
                 Err(err) if err.is_canceled() => {}
