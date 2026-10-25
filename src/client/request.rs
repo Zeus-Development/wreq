@@ -793,6 +793,22 @@ impl RequestBuilder {
         self
     }
 
+    // VIPER-PATCH(connection-reuse): RFC 9112 section 9.3.1 lets a client
+    // retransmit a request on a new connection after its connection closed
+    // prematurely; this asks for one.
+    /// Sends this request on a new connection rather than on an idle one
+    /// from the pool. The new connection joins the pool as usual. While
+    /// another HTTP/2 connection to the same destination is being made, the
+    /// request uses that one, which is new too.
+    pub fn new_connection(mut self, new_connection: bool) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .new_connection = new_connection;
+        }
+        self
+    }
+
     /// Build a `Request`, which can be inspected, modified and executed with
     /// [`Client::execute()`].
     #[inline]

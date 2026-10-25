@@ -245,6 +245,27 @@ impl Error {
         false
     }
 
+    // VIPER-PATCH(connection-reuse): RFC 9112 section 9.3.1 and RFC 9110
+    // section 9.2.2 let a client send an idempotent request again after a
+    // reused connection closed before its response; this tells it apart.
+    /// Returns true if the request was sent on a connection that served an
+    /// earlier request (one checked out of the pool) and failed there.
+    pub fn is_connection_reused(&self) -> bool {
+        use crate::client::layer::client::Error;
+
+        let mut source = self.source();
+
+        while let Some(err) = source {
+            if let Some(err) = err.downcast_ref::<Error>() {
+                return err.is_connection_reused();
+            }
+
+            source = err.source();
+        }
+
+        false
+    }
+
     /// Returns true if the error is related to a connection reset.
     pub fn is_connection_reset(&self) -> bool {
         let mut source = self.source();

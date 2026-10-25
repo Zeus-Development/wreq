@@ -29,6 +29,9 @@ pub(crate) struct RequestOptions {
     pub http1_options: Option<Http1Options>,
     pub http2_options: Option<Http2Options>,
     pub socket_bind_options: Option<SocketBindOptions>,
+    // VIPER-PATCH(connection-reuse): open a new connection instead of
+    // checking out an idle one.
+    pub new_connection: bool,
 }
 
 /// Configuration for the [`ConfigService`].

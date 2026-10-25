@@ -71,6 +71,9 @@ struct Config {
     retry_canceled_requests: bool,
     set_host: bool,
     ver: Ver,
+    // VIPER-PATCH(connection-reuse): this request opens a new connection
+    // instead of checking out an idle one (RFC 9112 section 9.3.1).
+    new_connection: bool,
 }
 
 #[derive(Debug)]
@@ -79,6 +82,9 @@ pub struct Error {
     source: Option<BoxError>,
     #[allow(unused)]
     connect_info: Option<Connected>,
+    // VIPER-PATCH(connection-reuse): whether the request was sent on a
+    // connection checked out of the pool.
+    connection_reused: bool,
 }
 
 #[derive(Debug)]
@@ -114,6 +120,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: None,
             connect_info: None,
+            connection_reused: false, // VIPER-PATCH(connection-reuse)
         }
     };
     ($kind:ident, $src:expr) => {
@@ -121,6 +128,7 @@ macro_rules! e {
             kind: ErrorKind::$kind,
             source: Some($src.into()),
             connect_info: None,
+            connection_reused: false, // VIPER-PATCH(connection-reuse)
         }
     };
 }
@@ -184,7 +192,9 @@ where
                 http1_options,
                 http2_options,
                 socket_bind_options,
+                new_connection, // VIPER-PATCH(connection-reuse)
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
+            this.config.new_connection = new_connection; // VIPER-PATCH(connection-reuse)
 
             if let Some(opts) = http1_options {
                 this.h1_builder = this.h1_builder.options(opts);
@@ -318,13 +328,17 @@ where
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
                         error: Error::new(ErrorKind::Canceled, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            // VIPER-PATCH(connection-reuse)
+                            .with_connect_info(pooled.conn_info.clone())
+                            .with_connection_reused(pooled.is_reused()),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
                         Error::new(ErrorKind::SendRequest, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            // VIPER-PATCH(connection-reuse)
+                            .with_connect_info(pooled.conn_info.clone())
+                            .with_connection_reused(pooled.is_reused()),
                     ))
                 };
             }
@@ -401,6 +415,18 @@ where
                 .connect_to(descriptor)
                 .await
                 .map_err(ClientConnectError::Normal);
+        }
+
+        // VIPER-PATCH(connection-reuse): a request that asks for a new
+        // connection skips the idle ones (RFC 9112 section 9.3.1); the new
+        // connection joins the pool as usual. While another HTTP/2
+        // connection to the destination is being made, the request waits
+        // for that one below, which is new too.
+        if self.config.new_connection {
+            match self.connect_to(descriptor.clone()).await {
+                Err(err) if err.is_canceled() => {}
+                connected => return connected.map_err(ClientConnectError::Normal),
+            }
         }
 
         // This actually races 2 different futures to try to get a ready
@@ -826,6 +852,7 @@ impl Builder {
                 retry_canceled_requests: true,
                 set_host: true,
                 ver: Ver::Auto,
+                new_connection: false, // VIPER-PATCH(connection-reuse)
             },
             exec: exec.clone(),
             h1_builder: conn::http1::Builder::default(),
@@ -1012,6 +1039,24 @@ impl Error {
             kind,
             source: Some(error),
             connect_info: None,
+            connection_reused: false, // VIPER-PATCH(connection-reuse)
+        }
+    }
+
+    // VIPER-PATCH(connection-reuse): whether the request was sent on a
+    // connection checked out of the pool, which a peer may have closed
+    // while it was idle (RFC 9112 section 9.3.1).
+    #[inline]
+    pub(crate) fn is_connection_reused(&self) -> bool {
+        self.connection_reused
+    }
+
+    // VIPER-PATCH(connection-reuse)
+    #[inline]
+    fn with_connection_reused(self, connection_reused: bool) -> Self {
+        Self {
+            connection_reused,
+            ..self
         }
     }
 
