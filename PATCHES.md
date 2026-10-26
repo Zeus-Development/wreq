@@ -177,7 +177,7 @@ fetches something (an intermediate certificate, a revocation status) would
 have blocked the connection's thread. With the patch, `CertVerifyHook::verify`
 also receives a `HandshakeEvidence` (`src/tls/verify.rs`): the OCSP response
 the server stapled (RFC 6066 section 8; in TLS 1.3 the leaf's
-`status_request` entry, RFC 8446 section 4.4.2.1) and the body of the
+`status_request` extension of its `CertificateEntry`, RFC 8446 section 4.4.2) and the body of the
 `signed_certificate_timestamp` extension (RFC 6962 section 3.3), each as
 received and present only when the client asked for it and the server sent
 it. It returns a `CertVerifyFuture` instead of a result.
@@ -193,7 +193,11 @@ the `ssl_server` defaults; the connection's verification parameters, its
 host among them; the public name after a refused ECH offer; the same alert
 for a failure; the error queue cleared when the library clears it). A
 refusal there ends the handshake as before, and `CertificateRefused` keeps
-its verification result. Then it calls the hook and polls its future with
+its verification result; a failure to set the verification up ends it
+whatever the verify mode, with the handshake's error unchanged, as in the
+library. So does a chain that cannot be encoded. A panic of the hook, which
+cannot unwind through the library's callback, is caught there, ends the
+handshake and is resumed in the connecting task, as before the patch. Then it calls the hook and polls its future with
 the waker of the task driving the handshake. While the future is pending,
 the callback returns `ssl_verify_retry`, the handshake returns
 `WANT_CERTIFICATE_VERIFY`, and the connector waits until the future wakes

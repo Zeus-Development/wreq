@@ -511,3 +511,59 @@ async fn a_resumed_connection_is_checked_after_its_handshake() {
     }
     assert_eq!(hook.calls.lock().unwrap().len(), 2);
 }
+
+// VIPER-PATCH(async-verify-evidence): fork review F1 and F3.
+
+/// A hook that panics when it is called, or when its answer is polled.
+struct Panicking {
+    in_poll: bool,
+}
+
+impl CertVerifyHook for Panicking {
+    fn verify(&self, _: &[&[u8]], _: &str, _: &HandshakeEvidence<'_>) -> CertVerifyFuture {
+        assert!(self.in_poll, "the hook panicked");
+        Box::pin(async { panic!("the hook's answer panicked") })
+    }
+}
+
+/// The library's callback cannot unwind, so a panic of the hook is caught
+/// there and resumed in the task that sent the request; the runtime goes
+/// on, and no request byte is sent.
+#[tokio::test]
+async fn a_panicking_hook_panics_the_requests_task_only() {
+    for in_poll in [false, true] {
+        let pki = pki((-1, 30));
+        let (url, received) = origin(&pki).await;
+        let client = builder(&pki, Arc::new(Panicking { in_poll }))
+            .build()
+            .unwrap();
+        let request = tokio::spawn(async move { client.get(&url).send().await.map(|_| ()) });
+        assert!(request.await.unwrap_err().is_panic(), "in_poll {in_poll}");
+        assert_eq!(received.await.unwrap(), None);
+    }
+    let (pki, hook) = (pki((-1, 30)), Arc::new(Recorder::default()));
+    let (url, _) = origin(&pki).await;
+    let response = client(&pki, &hook).get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+}
+
+/// With verification off, a chain the library refuses still goes to the
+/// hook, whose acceptance completes the connection, as before the patch;
+/// a second connection's handshake shows the library's error queue was
+/// left clean.
+#[tokio::test]
+async fn with_verification_off_a_chain_the_library_refuses_still_goes_to_the_hook() {
+    let (pki, other) = (pki((-1, 30)), pki((-1, 30)));
+    let hook = Arc::new(Recorder::default());
+    let (url, mut resumed) = resuming_origin(&pki, 2).await;
+    let client = builder(&other, Arc::clone(&hook) as _)
+        .tls_cert_verification(false)
+        .build()
+        .unwrap();
+    for _ in 0..2 {
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+        assert_eq!(resumed.recv().await, Some(false));
+    }
+    let calls = vec![(1, "127.0.0.1".to_owned()); 2];
+    assert_eq!(*hook.calls.lock().unwrap(), calls);
+}

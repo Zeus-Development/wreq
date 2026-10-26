@@ -14,12 +14,15 @@
 
 // VIPER-PATCH(async-verify-evidence)
 use std::{
+    any::Any, // VIPER-PATCH(async-verify-evidence): fork review F1.
     error::Error as StdError,
     fmt,
     future::Future,
     os::raw::c_int,
+    panic::{self, AssertUnwindSafe}, // VIPER-PATCH(async-verify-evidence)
     pin::Pin,
-    ptr, slice,
+    ptr,
+    slice, // VIPER-PATCH(async-verify-evidence)
     sync::{Arc, Mutex, PoisonError},
     task::{Context, Poll, Waker},
 };
@@ -75,7 +78,9 @@ pub type CertVerifyFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + 
 #[derive(Clone, Copy, Debug)]
 pub struct HandshakeEvidence<'a> {
     /// The stapled OCSP response (RFC 6066 section 8; in TLS 1.3 the
-    /// leaf's `status_request` entry, RFC 8446 section 4.4.2.1).
+    // VIPER-PATCH(async-verify-evidence)
+    /// `status_request` extension of the leaf's `CertificateEntry`, RFC 8446
+    /// section 4.4.2).
     pub ocsp_response: Option<&'a [u8]>,
     /// The `signed_certificate_timestamp` extension's body (RFC 6962
     /// section 3.3): a `SignedCertificateTimestampList`, each SCT behind its
@@ -139,7 +144,8 @@ impl CertificateRefused {
                     source,
                 }),
                 Some(Refusal::Hook(source)) => Self::hook(source),
-                None => source,
+                // VIPER-PATCH(async-verify-evidence): fork review F2.
+                Some(Refusal::Internal) | None => source,
             };
         }
         if !ssl.verify_mode().contains(SslVerifyMode::PEER) {
@@ -183,6 +189,21 @@ enum Refusal {
     Library(Option<X509VerifyError>),
     /// The hook, with its error.
     Hook(BoxError),
+    // VIPER-PATCH(async-verify-evidence): fork review F1 and F2.
+    /// The check could not run: the library's verification could not be
+    /// set up, the chain could not be encoded or the hook panicked. Fatal
+    /// whatever the verify mode, as a setup failure is in the library.
+    Internal,
+}
+
+/// Why the library's own verification failed.
+enum LibraryFailure {
+    /// It could not be set up; the library then fails the handshake
+    /// whatever the verify mode.
+    Setup,
+    /// The chain did not verify: the result, and the alert the library
+    /// sends.
+    Verify(Option<X509VerifyError>, SslAlert),
 }
 
 #[derive(Default)]
@@ -194,6 +215,10 @@ struct State {
     refused: Option<Refusal>,
     /// Whether the handshake verified the chain (a resumed one does not).
     ran: bool,
+    // VIPER-PATCH(async-verify-evidence): fork review F1.
+    /// A panic of the hook, caught in the library's callback (it cannot
+    /// unwind through the library), to resume in the connecting task.
+    panic: Option<Box<dyn Any + Send>>,
 }
 
 /// One handshake's run of a [`CertVerifyHook`], shared by the library's
@@ -239,18 +264,49 @@ impl Verification {
     /// verification, then the hook; `Retry` while its answer is pending.
     /// With verification off the library's failure does not end the
     /// handshake (as without a hook), and the library ignores any failure.
+    // VIPER-PATCH(async-verify-evidence): fork review F1 and F2: every
+    // failure is recorded, and a panic is caught.
     fn step(&self, ssl: &mut SslRef) -> Result<(), SslVerifyError> {
         let mut state = self.state();
+        // VIPER-PATCH(async-verify-evidence)
+        let stepped = panic::catch_unwind(AssertUnwindSafe(|| self.advance(&mut state, ssl)));
+        let refusal = match stepped {
+            Ok(Ok(Poll::Pending)) => return Err(SslVerifyError::Retry),
+            Ok(Ok(Poll::Ready(()))) => return Ok(()),
+            Ok(Err((refusal, alert))) => (refusal, alert),
+            Err(payload) => {
+                state.running = None;
+                state.panic = Some(payload);
+                (Refusal::Internal, SslAlert::INTERNAL_ERROR)
+            }
+        };
+        state.refused = Some(refusal.0);
+        Err(SslVerifyError::Invalid(refusal.1))
+    }
+
+    /// The custom verification's work: the library's own verification on
+    /// the first call, then the hook's answer, `Pending` while it is.
+    fn advance(
+        &self,
+        state: &mut State,
+        ssl: &mut SslRef,
+    ) -> Result<Poll<()>, (Refusal, SslAlert)> {
+        let internal = (Refusal::Internal, SslAlert::INTERNAL_ERROR);
         if state.running.is_none() {
             state.ran = true;
-            if let Err((verify_error, alert)) = library_verify(ssl)
-                && ssl.verify_mode().contains(SslVerifyMode::PEER)
-            {
-                state.refused = Some(Refusal::Library(verify_error));
-                return Err(SslVerifyError::Invalid(alert));
+            // VIPER-PATCH(async-verify-evidence)
+            match library_verify(ssl) {
+                Err(LibraryFailure::Setup) => return Err(internal),
+                Err(LibraryFailure::Verify(verify_error, alert))
+                    if ssl.verify_mode().contains(SslVerifyMode::PEER) =>
+                {
+                    return Err((Refusal::Library(verify_error), alert));
+                }
+                Ok(()) | Err(LibraryFailure::Verify(..)) => {}
             }
             let Ok(chain) = der_chain(ssl) else {
-                return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
+                // VIPER-PATCH(async-verify-evidence)
+                return Err(internal);
             };
             let chain: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
             let evidence = HandshakeEvidence::of(ssl);
@@ -258,17 +314,28 @@ impl Verification {
         }
         let waker = state.waker.clone().unwrap_or_else(|| Waker::noop().clone());
         let Some(running) = state.running.as_mut() else {
-            return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
+            // VIPER-PATCH(async-verify-evidence)
+            return Err(internal);
         };
         let answer = match running.as_mut().poll(&mut Context::from_waker(&waker)) {
-            Poll::Pending => return Err(SslVerifyError::Retry),
+            // VIPER-PATCH(async-verify-evidence)
+            Poll::Pending => return Ok(Poll::Pending),
             Poll::Ready(answer) => answer,
         };
         state.running = None;
-        answer.map_err(|source| {
-            state.refused = Some(Refusal::Hook(source));
-            SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN)
-        })
+        match answer {
+            Ok(()) => Ok(Poll::Ready(())),
+            Err(source) => Err((Refusal::Hook(source), SslAlert::CERTIFICATE_UNKNOWN)),
+        }
+    }
+
+    // VIPER-PATCH(async-verify-evidence): fork review F1.
+    /// Resumes, in the task driving the handshake, a panic of the hook that
+    /// the library's callback caught.
+    pub(crate) fn resume_panic(&self) {
+        if let Some(payload) = self.state().panic.take() {
+            panic::resume_unwind(payload);
+        }
     }
 
     /// After a successful handshake on `ssl`: the hook's refusal, which the
@@ -279,8 +346,14 @@ impl Verification {
         ssl: &SslRef,
     ) -> Result<Option<CertVerifyFuture>, BoxError> {
         let mut state = self.state();
-        if let Some(Refusal::Hook(source)) = state.refused.take() {
-            return Err(CertificateRefused::hook(source));
+        // VIPER-PATCH(async-verify-evidence): fork review F2: an internal
+        // failure stays fatal with verification off.
+        match state.refused.take() {
+            Some(Refusal::Hook(source)) => return Err(CertificateRefused::hook(source)),
+            Some(Refusal::Internal) => {
+                return Err("the server's certificate could not be checked".into());
+            }
+            Some(Refusal::Library(_)) | None => {}
         }
         if state.ran {
             return Ok(None);
@@ -312,9 +385,13 @@ fn der_chain(ssl: &SslRef) -> Result<Vec<Vec<u8>>, BoxError> {
 /// trust store (the connector sets no separate verify store), the
 /// `ssl_server` defaults, the connection's verification parameters (its
 /// host among them) and, after a refused ECH offer, the public name. On
-/// failure, the verification result and the alert the library sends.
+// VIPER-PATCH(async-verify-evidence)
+/// failure, whether it could not be set up, or the verification result and
+/// the alert the library sends.
 #[allow(unsafe_code)]
-fn library_verify(ssl: &SslRef) -> Result<(), (Option<X509VerifyError>, SslAlert)> {
+// VIPER-PATCH(async-verify-evidence): fork review F2: a setup failure is
+// told apart from a verification result.
+fn library_verify(ssl: &SslRef) -> Result<(), LibraryFailure> {
     struct StoreContext(*mut ffi::X509_STORE_CTX);
     impl Drop for StoreContext {
         fn drop(&mut self) {
@@ -322,19 +399,22 @@ fn library_verify(ssl: &SslRef) -> Result<(), (Option<X509VerifyError>, SslAlert
             unsafe { ffi::X509_STORE_CTX_free(self.0) }
         }
     }
-    let internal = Err((None, SslAlert::INTERNAL_ERROR));
+    // VIPER-PATCH(async-verify-evidence)
     let Some(chain) = ssl.peer_cert_chain() else {
-        return internal;
+        // VIPER-PATCH(async-verify-evidence)
+        return Err(LibraryFailure::Setup);
     };
     let Some(leaf) = chain.get(0) else {
-        return internal;
+        // VIPER-PATCH(async-verify-evidence)
+        return Err(LibraryFailure::Setup);
     };
     // SAFETY: `ssl`, its context, `chain` and `leaf` are live for this call;
     // the store context is initialized before use and freed by `StoreContext`.
     unsafe {
         let ctx = ffi::X509_STORE_CTX_new();
         if ctx.is_null() {
-            return internal;
+            // VIPER-PATCH(async-verify-evidence)
+            return Err(LibraryFailure::Setup);
         }
         let ctx = StoreContext(ctx);
         let raw = ssl.as_ptr();
@@ -349,7 +429,8 @@ fn library_verify(ssl: &SslRef) -> Result<(), (Option<X509VerifyError>, SslAlert
             && ffi::X509_VERIFY_PARAM_set1(param(), ffi::SSL_get0_param(raw)) != 0
             && (name_len == 0 || ffi::X509_VERIFY_PARAM_set1_host(param(), name, name_len) != 0);
         if !ready {
-            return internal;
+            // VIPER-PATCH(async-verify-evidence)
+            return Err(LibraryFailure::Setup);
         }
         let verified = ffi::X509_verify_cert(ctx.0) > 0;
         // As the library: a failure with verification off is not fatal.
@@ -361,7 +442,11 @@ fn library_verify(ssl: &SslRef) -> Result<(), (Option<X509VerifyError>, SslAlert
         }
         let result = ffi::X509_STORE_CTX_get_error(ctx.0);
         let alert = alert(ffi::SSL_alert_from_verify_result(result.into()));
-        Err((X509VerifyError::from_raw(result).err(), alert))
+        // VIPER-PATCH(async-verify-evidence)
+        Err(LibraryFailure::Verify(
+            X509VerifyError::from_raw(result).err(),
+            alert,
+        ))
     }
 }
 

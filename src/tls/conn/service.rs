@@ -51,13 +51,21 @@ where
             verification.set_waker(cx.waker());
         }
         match Pin::new(&mut stream).poll_connect(cx) {
-            Poll::Ready(Err(error)) if error.code() == ErrorCode::WANT_CERTIFICATE_VERIFY => {
+            // VIPER-PATCH(async-verify-evidence)
+            Poll::Ready(Err(error))
+                if verification.is_some() && error.code() == ErrorCode::WANT_CERTIFICATE_VERIFY =>
+            {
                 Poll::Pending
             }
             ready => ready,
         }
     })
     .await;
+    // VIPER-PATCH(async-verify-evidence): fork review F1: the hook's panic
+    // reaches this task, as before the patch.
+    if let Some(verification) = &verification {
+        verification.resume_panic();
+    }
     // VIPER-PATCH(verify-hook): the verification result of a refusal.
     // VIPER-PATCH(async-verify-evidence)
     if let Err(error) = handshake {
