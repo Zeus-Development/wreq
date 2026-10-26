@@ -2,35 +2,106 @@
 // handshake's own verification and before the connection is handed out,
 // so before any request byte; and the verification result of a refused
 // handshake, kept in a public typed error (RFC 5280 section 6, RFC 9525).
+// VIPER-PATCH(async-verify-evidence): the check runs inside the handshake,
+// as the TLS library's custom verification after the library's own chain
+// and name verification, sees the stapled OCSP response (RFC 6066 section
+// 8) and the signed certificate timestamps of the TLS extension (RFC 6962
+// section 3.3), and may answer later: the handshake waits for it (the
+// library's `ssl_verify_retry`) without blocking its thread.
 
 //! A caller's check of the server's certificate chain, and the error of a
 //! refused certificate.
 
-use std::{error::Error as StdError, fmt, sync::Arc};
+// VIPER-PATCH(async-verify-evidence)
+use std::{
+    error::Error as StdError,
+    fmt,
+    future::Future,
+    os::raw::c_int,
+    pin::Pin,
+    ptr, slice,
+    sync::{Arc, Mutex, PoisonError},
+    task::{Context, Poll, Waker},
+};
 
 use btls::{
-    ssl::{SslRef, SslVerifyMode},
+    // VIPER-PATCH(async-verify-evidence)
+    ssl::{SslAlert, SslRef, SslVerifyError, SslVerifyMode},
     x509::X509VerifyError,
 };
+// VIPER-PATCH(async-verify-evidence)
+use btls_sys as ffi;
+use foreign_types::ForeignTypeRef;
 use tower::BoxError;
 
+// VIPER-PATCH(async-verify-evidence): the check gets the handshake's
+// evidence and answers through a future.
 /// A caller's check of the server's certificate chain, run once per new TLS
-/// connection after the handshake (and its own chain and name verification)
-/// succeeded, and before the connection carries any request byte.
+// VIPER-PATCH(async-verify-evidence)
+/// connection inside the handshake, after the handshake's own chain and
+/// name verification succeeded, and before the connection carries any
+/// request byte. On a resumed connection, where the handshake verifies
+/// nothing again, it runs on the session's chain once the handshake ends,
+/// still before any request byte.
 pub trait CertVerifyHook: Send + Sync {
     /// Checks `chain` (DER, the server's certificate first, as the server
-    /// sent it) for `server_name` (the host the connection was made for). An
-    /// error refuses the certificate: the connection is closed and the
-    /// request fails with a [`CertificateRefused`] holding this error.
+    // VIPER-PATCH(async-verify-evidence)
+    /// sent it) for `server_name` (the host the connection was made for),
+    /// with what else the handshake delivered for it (`evidence`). The
+    /// handshake waits for the returned future without blocking its thread.
+    /// An error refuses the certificate: the handshake ends with an alert
+    /// (after it, on a resumed connection), the connection is closed and
+    /// the request fails with a [`CertificateRefused`] holding this error.
     fn verify(
         &self,
         chain: &[&[u8]],
         server_name: &str,
-    ) -> Result<(), Box<dyn StdError + Send + Sync>>;
+        // VIPER-PATCH(async-verify-evidence)
+        evidence: &HandshakeEvidence<'_>,
+    ) -> CertVerifyFuture;
 }
 
 /// A shared [`CertVerifyHook`].
 pub type CertVerifyHookRef = Arc<dyn CertVerifyHook>;
+
+// VIPER-PATCH(async-verify-evidence): the hook's answer, and the evidence.
+/// A [`CertVerifyHook`]'s answer: `Ok` accepts the certificate.
+pub type CertVerifyFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+/// What the handshake delivered for the server's certificate besides its
+/// chain, as received; each is present only when the client asked for it
+/// and the server sent it.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct HandshakeEvidence<'a> {
+    /// The stapled OCSP response (RFC 6066 section 8; in TLS 1.3 the
+    /// leaf's `status_request` entry, RFC 8446 section 4.4.2.1).
+    pub ocsp_response: Option<&'a [u8]>,
+    /// The `signed_certificate_timestamp` extension's body (RFC 6962
+    /// section 3.3): a `SignedCertificateTimestampList`, each SCT behind its
+    /// two-byte length, as the library checked its syntax.
+    pub sct_list: Option<&'a [u8]>,
+}
+
+impl<'a> HandshakeEvidence<'a> {
+    fn of(ssl: &'a SslRef) -> Self {
+        Self {
+            ocsp_response: ssl.ocsp_status(),
+            sct_list: sct_list(ssl),
+        }
+    }
+}
+
+/// The SCT list `ssl`'s session holds, if any.
+#[allow(unsafe_code)]
+fn sct_list(ssl: &SslRef) -> Option<&[u8]> {
+    let (mut data, mut len) = (ptr::null(), 0);
+    // SAFETY: `ssl` is a live connection; the library points `data` at
+    // `len` bytes its session owns, which outlive the borrow of `ssl`.
+    unsafe { ffi::SSL_get0_signed_cert_timestamp_list(ssl.as_ptr(), &mut data, &mut len) };
+    // SAFETY: as above; `data` is non-null and `len` bytes long.
+    (len != 0 && !data.is_null()).then(|| unsafe { slice::from_raw_parts(data, len) })
+}
 
 /// A server certificate that was refused before any request byte: by the
 /// handshake's own verification ([`Self::verify_error`] says why) or by the
@@ -48,12 +119,29 @@ impl CertificateRefused {
         self.verify_error
     }
 
+    // VIPER-PATCH(async-verify-evidence): a refusal `verification` recorded.
     /// The handshake error `source`, wrapped when the handshake's own
     /// verification failed on `ssl`; any other failure stays as it is. A
     /// handshake that failed before verifying reports `INVALID_CALL`. With
     /// verification off the library still verifies and keeps the result,
-    /// which then never ends the handshake, so a failure is unchanged.
-    pub(crate) fn from_handshake(ssl: &SslRef, source: BoxError) -> BoxError {
+    // VIPER-PATCH(async-verify-evidence)
+    /// which then never ends the handshake, so a failure is unchanged. With
+    /// a hook, `verification` holds what refused the certificate.
+    pub(crate) fn from_handshake(
+        ssl: &SslRef,
+        verification: Option<&Verification>,
+        source: BoxError,
+    ) -> BoxError {
+        if let Some(verification) = verification {
+            return match verification.take_refusal() {
+                Some(Refusal::Library(verify_error)) => Box::new(Self {
+                    verify_error,
+                    source,
+                }),
+                Some(Refusal::Hook(source)) => Self::hook(source),
+                None => source,
+            };
+        }
         if !ssl.verify_mode().contains(SslVerifyMode::PEER) {
             return source;
         }
@@ -66,24 +154,11 @@ impl CertificateRefused {
         }
     }
 
-    /// Runs `hook` on `ssl`'s peer chain for `server_name`.
-    pub(crate) fn check(
-        hook: &dyn CertVerifyHook,
-        ssl: &SslRef,
-        server_name: &str,
-    ) -> Result<(), BoxError> {
-        let der = ssl
-            .peer_cert_chain()
-            .into_iter()
-            .flatten()
-            .map(|cert| cert.to_der())
-            .collect::<Result<Vec<_>, _>>()?;
-        let chain: Vec<&[u8]> = der.iter().map(Vec::as_slice).collect();
-        hook.verify(&chain, server_name).map_err(|source| {
-            Box::new(Self {
-                verify_error: None,
-                source,
-            }) as BoxError
+    // VIPER-PATCH(async-verify-evidence): the hook's refusal.
+    fn hook(source: BoxError) -> BoxError {
+        Box::new(Self {
+            verify_error: None,
+            source,
         })
     }
 }
@@ -97,5 +172,210 @@ impl fmt::Display for CertificateRefused {
 impl StdError for CertificateRefused {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         Some(&*self.source)
+    }
+}
+
+// VIPER-PATCH(async-verify-evidence): one handshake's run of the hook, as
+// the library's custom verification.
+/// What refused a certificate during the handshake.
+enum Refusal {
+    /// The library's own verification, with its result.
+    Library(Option<X509VerifyError>),
+    /// The hook, with its error.
+    Hook(BoxError),
+}
+
+#[derive(Default)]
+struct State {
+    /// The waker of the task driving the handshake.
+    waker: Option<Waker>,
+    /// The hook's answer while it is pending.
+    running: Option<CertVerifyFuture>,
+    refused: Option<Refusal>,
+    /// Whether the handshake verified the chain (a resumed one does not).
+    ran: bool,
+}
+
+/// One handshake's run of a [`CertVerifyHook`], shared by the library's
+/// custom verification callback and the connector driving the handshake.
+pub(crate) struct Verification {
+    hook: CertVerifyHookRef,
+    host: String,
+    state: Mutex<State>,
+}
+
+impl Verification {
+    /// Installs `hook` on `ssl` as the library's custom verification, for
+    /// `host`, keeping `ssl`'s verify mode.
+    pub(crate) fn install(hook: &CertVerifyHookRef, ssl: &mut SslRef, host: &str) -> Arc<Self> {
+        let this = Arc::new(Self {
+            hook: Arc::clone(hook),
+            host: host.to_owned(),
+            state: Mutex::default(),
+        });
+        let callback = Arc::clone(&this);
+        let mode = ssl.verify_mode();
+        ssl.set_custom_verify_callback(mode, move |ssl| callback.step(ssl));
+        this
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wakes `waker`'s task when a pending answer is ready.
+    pub(crate) fn set_waker(&self, waker: &Waker) {
+        match &mut self.state().waker {
+            Some(current) => current.clone_from(waker),
+            slot => *slot = Some(waker.clone()),
+        }
+    }
+
+    fn take_refusal(&self) -> Option<Refusal> {
+        self.state().refused.take()
+    }
+
+    /// One call of the custom verification: the library's own
+    /// verification, then the hook; `Retry` while its answer is pending.
+    /// With verification off the library's failure does not end the
+    /// handshake (as without a hook), and the library ignores any failure.
+    fn step(&self, ssl: &mut SslRef) -> Result<(), SslVerifyError> {
+        let mut state = self.state();
+        if state.running.is_none() {
+            state.ran = true;
+            if let Err((verify_error, alert)) = library_verify(ssl)
+                && ssl.verify_mode().contains(SslVerifyMode::PEER)
+            {
+                state.refused = Some(Refusal::Library(verify_error));
+                return Err(SslVerifyError::Invalid(alert));
+            }
+            let Ok(chain) = der_chain(ssl) else {
+                return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
+            };
+            let chain: Vec<&[u8]> = chain.iter().map(Vec::as_slice).collect();
+            let evidence = HandshakeEvidence::of(ssl);
+            state.running = Some(self.hook.verify(&chain, &self.host, &evidence));
+        }
+        let waker = state.waker.clone().unwrap_or_else(|| Waker::noop().clone());
+        let Some(running) = state.running.as_mut() else {
+            return Err(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR));
+        };
+        let answer = match running.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Pending => return Err(SslVerifyError::Retry),
+            Poll::Ready(answer) => answer,
+        };
+        state.running = None;
+        answer.map_err(|source| {
+            state.refused = Some(Refusal::Hook(source));
+            SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN)
+        })
+    }
+
+    /// After a successful handshake on `ssl`: the hook's refusal, which the
+    /// library ignored with verification off; or, on a resumed connection,
+    /// the hook's check of the session's chain, to wait for.
+    pub(crate) fn after_handshake(
+        &self,
+        ssl: &SslRef,
+    ) -> Result<Option<CertVerifyFuture>, BoxError> {
+        let mut state = self.state();
+        if let Some(Refusal::Hook(source)) = state.refused.take() {
+            return Err(CertificateRefused::hook(source));
+        }
+        if state.ran {
+            return Ok(None);
+        }
+        let der = der_chain(ssl)?;
+        let chain: Vec<&[u8]> = der.iter().map(Vec::as_slice).collect();
+        let evidence = HandshakeEvidence::of(ssl);
+        let check = self.hook.verify(&chain, &self.host, &evidence);
+        Ok(Some(Box::pin(async move {
+            check.await.map_err(CertificateRefused::hook)
+        })))
+    }
+}
+
+/// `ssl`'s peer chain in DER, the server's certificate first.
+fn der_chain(ssl: &SslRef) -> Result<Vec<Vec<u8>>, BoxError> {
+    let der = ssl
+        .peer_cert_chain()
+        .into_iter()
+        .flatten()
+        .map(|cert| cert.to_der())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(der)
+}
+
+/// The library's own verification of `ssl`'s peer chain, as it runs it
+/// when no custom verification is set (BoringSSL's
+/// `ssl_crypto_x509_session_verify_cert_chain`, client side): the context's
+/// trust store (the connector sets no separate verify store), the
+/// `ssl_server` defaults, the connection's verification parameters (its
+/// host among them) and, after a refused ECH offer, the public name. On
+/// failure, the verification result and the alert the library sends.
+#[allow(unsafe_code)]
+fn library_verify(ssl: &SslRef) -> Result<(), (Option<X509VerifyError>, SslAlert)> {
+    struct StoreContext(*mut ffi::X509_STORE_CTX);
+    impl Drop for StoreContext {
+        fn drop(&mut self) {
+            // SAFETY: the context was allocated by `X509_STORE_CTX_new`.
+            unsafe { ffi::X509_STORE_CTX_free(self.0) }
+        }
+    }
+    let internal = Err((None, SslAlert::INTERNAL_ERROR));
+    let Some(chain) = ssl.peer_cert_chain() else {
+        return internal;
+    };
+    let Some(leaf) = chain.get(0) else {
+        return internal;
+    };
+    // SAFETY: `ssl`, its context, `chain` and `leaf` are live for this call;
+    // the store context is initialized before use and freed by `StoreContext`.
+    unsafe {
+        let ctx = ffi::X509_STORE_CTX_new();
+        if ctx.is_null() {
+            return internal;
+        }
+        let ctx = StoreContext(ctx);
+        let raw = ssl.as_ptr();
+        let store = ffi::SSL_CTX_get_cert_store(ffi::SSL_get_SSL_CTX(raw));
+        let (mut name, mut name_len) = (ptr::null(), 0);
+        ffi::SSL_get0_ech_name_override(raw, &mut name, &mut name_len);
+        let param = || ffi::X509_STORE_CTX_get0_param(ctx.0);
+        let index = ffi::SSL_get_ex_data_X509_STORE_CTX_idx();
+        let ready = ffi::X509_STORE_CTX_init(ctx.0, store, leaf.as_ptr(), chain.as_ptr()) != 0
+            && ffi::X509_STORE_CTX_set_ex_data(ctx.0, index, raw.cast()) != 0
+            && ffi::X509_STORE_CTX_set_default(ctx.0, c"ssl_server".as_ptr()) != 0
+            && ffi::X509_VERIFY_PARAM_set1(param(), ffi::SSL_get0_param(raw)) != 0
+            && (name_len == 0 || ffi::X509_VERIFY_PARAM_set1_host(param(), name, name_len) != 0);
+        if !ready {
+            return internal;
+        }
+        let verified = ffi::X509_verify_cert(ctx.0) > 0;
+        // As the library: a failure with verification off is not fatal.
+        if verified || !ssl.verify_mode().contains(SslVerifyMode::PEER) {
+            ffi::ERR_clear_error();
+        }
+        if verified {
+            return Ok(());
+        }
+        let result = ffi::X509_STORE_CTX_get_error(ctx.0);
+        let alert = alert(ffi::SSL_alert_from_verify_result(result.into()));
+        Err((X509VerifyError::from_raw(result).err(), alert))
+    }
+}
+
+/// The alert `SSL_alert_from_verify_result` names.
+fn alert(raw: c_int) -> SslAlert {
+    match raw {
+        ffi::SSL_AD_UNKNOWN_CA => SslAlert::UNKNOWN_CA,
+        ffi::SSL_AD_BAD_CERTIFICATE => SslAlert::BAD_CERTIFICATE,
+        ffi::SSL_AD_DECRYPT_ERROR => SslAlert::DECRYPT_ERROR,
+        ffi::SSL_AD_CERTIFICATE_EXPIRED => SslAlert::CERTIFICATE_EXPIRED,
+        ffi::SSL_AD_CERTIFICATE_REVOKED => SslAlert::CERTIFICATE_REVOKED,
+        ffi::SSL_AD_INTERNAL_ERROR => SslAlert::INTERNAL_ERROR,
+        ffi::SSL_AD_HANDSHAKE_FAILURE => SslAlert::HANDSHAKE_FAILURE,
+        ffi::SSL_AD_UNSUPPORTED_CERTIFICATE => SslAlert::UNSUPPORTED_CERTIFICATE,
+        _ => SslAlert::CERTIFICATE_UNKNOWN,
     }
 }

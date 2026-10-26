@@ -67,6 +67,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `proxy-alpn` | a proxy may carry an ALPN list (RFC 7301), offered in order on the TLS connection to an HTTPS proxy that tunnels with `CONNECT`; without one nothing is offered, as before | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 a_proxy_that_refuses_h2_gets_an_http1_tunnel` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `h2-proxy-connect` | when that proxy selects `h2`, each tunnel is a `CONNECT` stream of one HTTP/2 connection to the proxy, shared by the client's tunnels through it while it stays open (RFC 9113 section 8.5); another selection, or none, gets an HTTP/1.1 `CONNECT` on that connection | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 two_tunnels_share_one_http2_connection_to_the_proxy` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connection-reuse` | a request that failed on a connection checked out of the pool says so (`Error::is_connection_reused`), and a request may ask for a new connection instead of an idle one (`RequestBuilder::new_connection`; over HTTP/2 with the limits in its section), so a client can send an idempotent request again on a new connection after its connection closed before the response (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_connection_reuse.rs`; Viper: `viper-net::resend a_reused_connection_closed_before_the_response_is_sent_again` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `async-verify-evidence` | the caller's certificate check runs inside the handshake, as the TLS library's custom verification after the library's own chain and name verification (mirrored exactly), sees the stapled OCSP response (RFC 6066 section 8) and the SCT list of the TLS extension (RFC 6962 section 3.3), and may answer later through a future, the handshake waiting without blocking its thread (the library's `ssl_verify_retry`); its refusal ends the handshake with an alert, before any request byte | none | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_later_answer_lets_another_sessions_fetch_complete_meanwhile` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -107,6 +108,8 @@ failed before verifying (the result is `INVALID_CALL`) or after it
 succeeded is unchanged, and so is any failure with verification off (the
 library still verifies then, but its result never ends the handshake).
 Without a hook nothing else changes.
+Since `async-verify-evidence` the hook runs inside the handshake, with the
+handshake's evidence, and may answer later (that patch's section).
 
 ## proxy-alpn
 
@@ -164,6 +167,57 @@ pooled one, and a failure there is reported as reused. RFC 9112 section
 a request without the option uses the pool as before, and wreq's own
 retries are unchanged.
 
+## async-verify-evidence
+
+The `verify-hook` patch ran the caller's check after the handshake, on its
+own, with the chain and the host only, and its answer had to be ready when
+the call returned. A check that needs the handshake's stapled OCSP response
+or its signed certificate timestamps could not get them, and a check that
+fetches something (an intermediate certificate, a revocation status) would
+have blocked the connection's thread. With the patch, `CertVerifyHook::verify`
+also receives a `HandshakeEvidence` (`src/tls/verify.rs`): the OCSP response
+the server stapled (RFC 6066 section 8; in TLS 1.3 the leaf's
+`status_request` entry, RFC 8446 section 4.4.2.1) and the body of the
+`signed_certificate_timestamp` extension (RFC 6962 section 3.3), each as
+received and present only when the client asked for it and the server sent
+it. It returns a `CertVerifyFuture` instead of a result.
+
+The TLS connector (`src/tls/conn/service.rs`) installs the hook on each
+connection as the library's custom verification (`SSL_set_custom_verify`,
+keeping the connection's verify mode), so it runs inside the handshake.
+Because a custom verification replaces the library's own, the callback
+first runs the library's own verification exactly as the library runs it
+without one (`ssl_crypto_x509_session_verify_cert_chain`, client side: the
+context's trust store, since the connector sets no separate verify store;
+the `ssl_server` defaults; the connection's verification parameters, its
+host among them; the public name after a refused ECH offer; the same alert
+for a failure; the error queue cleared when the library clears it). A
+refusal there ends the handshake as before, and `CertificateRefused` keeps
+its verification result. Then it calls the hook and polls its future with
+the waker of the task driving the handshake. While the future is pending,
+the callback returns `ssl_verify_retry`, the handshake returns
+`WANT_CERTIFICATE_VERIFY`, and the connector waits until the future wakes
+it, so the thread serves other connections meanwhile. The hook's refusal
+ends the handshake with the library's default alert for a custom refusal
+(`certificate_unknown`), before the client's `Finished`, so before any
+request byte. With verification off the library ignores a failed custom
+verification (as it ignores its own), so the hook's refusal ends the
+connection right after the handshake, as with `verify-hook`. A resumed
+handshake verifies nothing again, so on a resumed connection the hook
+checks the session's chain, with the session's evidence, after the
+handshake and before the stream is handed out, as with `verify-hook`.
+
+What changes from `verify-hook`: the check runs inside the handshake
+rather than after it, so a server sees a refusal as an alert rather than a
+closed connection after a completed handshake; and with a hook,
+`SslRef::verify_result` reports `X509_V_OK` after a successful custom
+verification, the library's convention, rather than its own result (with
+verification off, its own failure). Nothing reads that result outside the
+refusal path, where `CertificateRefused` keeps the library's own. Without a
+hook nothing changes: the handshake is driven as before. The patch adds the
+`foreign-types` dependency, already in the graph through `btls`, for the
+library's raw pointers.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -190,3 +244,4 @@ retries are unchanged.
 | V16d-4 | the last commit of this range | the patch `verify-hook` |
 | V16d-3d | the last commit of this range | the patches `proxy-alpn` and `h2-proxy-connect` |
 | NET-RESEND-1 | the last commit of this range | the patch `connection-reuse` |
+| NET-CERT-SEAM-1 | the last commit of this range | the patch `async-verify-evidence` |
