@@ -73,6 +73,7 @@ other package, keeps its own version and is not built from this fork.
 | --- | --- | --- | --- | --- | --- |
 | `header-count-growth` | a response head with more fields than the parser's default slots is parsed again with more slots; only the head's size bounds it (RFC 9110 and RFC 9112 set no field-count limit) | `adr:net-header-fidelity` (its field-count part) | fork: `src/proto/http1/role.rs` `viper_patch_tests`; Viper: `viper-net::fetch a_heads_size_bounds_it_and_not_its_field_count` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `content-length-values` | differing `Content-Length` values get their own parse error, told apart from an unreadable value (RFC 9112 section 6.3) | `adr:net-content-length-parse` | fork: `src/proto/http1/role.rs` `viper_content_length_tests`; Viper: `viper-net::fetch differing_content_length_values_are_told_from_an_unreadable_one` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `response-bytes` | an HTTP/1 request whose connection fails before the response head is complete (an end of stream, a failed read or a failed write) learns whether any response byte had arrived, an informational response or part of the head, so a client can tell an unanswered request from a partly answered one when it decides on an automatic retry (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_response_bytes.rs`; Viper: `viper-net::resend basic_resends_only_before_any_response_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## header-count-growth
 
@@ -98,6 +99,25 @@ their own error, `differing content-length values parsed`, with the
 predicate `Error::is_parse_content_length_differ`. A list of identical
 values is still accepted, as before.
 
+## response-bytes
+
+The HTTP/1 client reported a connection that ended, or failed to read or
+write, before the response head was complete with the same error whether
+or not part of a response had arrived: an end of stream after a partial
+head was an incomplete message, as was one with no byte at all. RFC 9112
+section 9.3.1 and RFC 9110 section 9.2.2 leave automatic retries to the
+client, which needs to know whether the server had begun to answer. With
+the patch, `Error::received_response_bytes` says whether any byte had
+arrived for the head being read: part of the final head, an informational
+(1xx) response, or empty lines before a head. `Buffered` records that a
+read returned bytes while a head was parsed, cleared once a head is
+complete; `Conn::on_read_head_error` sets it on a failed head read (before
+the leading empty lines are dropped), and `Dispatcher::poll_catch` on every
+other failure delivered in place of a response (a failed write, say). It is
+false for every HTTP/2 error; for an error after the head (a body's) it has
+no meaning. Nothing else changes: the error's kind, cause and message stay
+as they were.
+
 ## Rebase procedure
 
 1. A new wreq-proto release gets a new branch, `viper/wreq-proto-<version>`,
@@ -120,4 +140,5 @@ values is still accepted, as before.
 
 | Viper task | Commit | Change |
 | --- | --- | --- |
-| V16d-3a | the last commit of this range | the branch, the base and the patches `header-count-growth` and `content-length-values` |
+| V16d-3a | `ebb0c589afdb82f559df4000e6e26052f7daeb7f` | the branch, the base and the patches `header-count-growth` and `content-length-values` |
+| NET-RESEND-2 | the last commit of this range | the patch `response-bytes` |

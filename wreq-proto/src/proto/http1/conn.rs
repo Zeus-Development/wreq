@@ -126,6 +126,12 @@ where
         self.state.is_write_closed()
     }
 
+    // VIPER-PATCH(response-bytes): whether any byte of the head being read
+    // has arrived.
+    pub(super) fn has_head_bytes(&self) -> bool {
+        self.io.has_head_bytes()
+    }
+
     pub(super) fn can_read_head(&self) -> bool {
         if !matches!(self.state.reading, Reading::Init) {
             return false;
@@ -241,6 +247,10 @@ where
         // message should be reported as an error. If not, it is just
         // the connection closing gracefully.
         let must_error = self.should_error_on_eof();
+        // VIPER-PATCH(response-bytes): the error says whether any response
+        // byte arrived first (RFC 9112 section 9.3.1); counted before the
+        // leading empty lines are dropped, as those arrived too.
+        let e = e.with_response_bytes(self.io.has_head_bytes());
         self.close_read();
         self.io.consume_leading_lines();
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();

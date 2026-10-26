@@ -36,6 +36,9 @@ pub(crate) struct Buffered<T, B> {
     partial_len: Option<usize>,
     read_blocked: bool,
     read_buf: BytesMut,
+    // VIPER-PATCH(response-bytes): whether bytes were read since the last
+    // complete head, so a failure can say if a response had begun.
+    head_bytes: bool,
     read_buf_strategy: ReadStrategy,
     write_buf: WriteBuf<B>,
 }
@@ -69,6 +72,8 @@ where
             partial_len: None,
             read_blocked: false,
             read_buf: BytesMut::new(),
+            // VIPER-PATCH(response-bytes): nothing read yet.
+            head_bytes: false,
             read_buf_strategy: ReadStrategy::default(),
             write_buf: WriteBuf::new(strategy),
         }
@@ -103,6 +108,13 @@ where
         // so this assert is here to catch myself
         debug_assert!(self.write_buf.queue.bufs_cnt() == 0);
         self.write_buf.set_strategy(WriteStrategy::Queue);
+    }
+
+    // VIPER-PATCH(response-bytes): whether any byte arrived for the head
+    // being read (an informational head's included), in the buffer or not.
+    #[inline]
+    pub(crate) fn has_head_bytes(&self) -> bool {
+        self.head_bytes || !self.read_buf.is_empty()
     }
 
     #[inline]
@@ -184,6 +196,8 @@ where
                 Some(msg) => {
                     debug!("parsed {} headers", msg.head.headers.len());
                     self.partial_len = None;
+                    // VIPER-PATCH(response-bytes): the next head starts afresh.
+                    self.head_bytes = false;
                     return Poll::Ready(Ok(msg));
                 }
                 None => {
@@ -206,6 +220,9 @@ where
                 trace!("parse eof");
                 return Poll::Ready(Err(Error::new_incomplete()));
             }
+            // VIPER-PATCH(response-bytes): a response has begun, even if a
+            // 1xx head consumes these bytes.
+            self.head_bytes = true;
         }
     }
 

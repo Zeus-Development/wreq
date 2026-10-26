@@ -36,6 +36,9 @@ pub struct Error {
 struct ErrorImpl {
     kind: Kind,
     cause: Option<Cause>,
+    // VIPER-PATCH(response-bytes): whether any byte of the response had
+    // arrived when the error was raised (RFC 9112 section 9.3.1).
+    response_bytes: bool,
 }
 
 #[derive(Debug)]
@@ -155,6 +158,18 @@ impl Error {
         matches!(self.inner.kind, Kind::IncompleteMessage)
     }
 
+    /// VIPER-PATCH(response-bytes): for the error an HTTP/1 request gets in
+    /// place of its response, returns true if any byte of the response (an
+    /// informational response or part of the final head) had arrived when
+    /// the connection failed, false if none had. A client deciding whether
+    /// to retry the request automatically needs to tell the two apart (RFC
+    /// 9112 section 9.3.1, RFC 9110 section 9.2.2). False for every HTTP/2
+    /// error; for other errors it has no meaning.
+    #[inline]
+    pub fn received_response_bytes(&self) -> bool {
+        self.inner.response_bytes
+    }
+
     /// Returns true if the body write was aborted.
     #[inline]
     pub fn is_body_write_aborted(&self) -> bool {
@@ -170,13 +185,26 @@ impl Error {
     #[inline]
     pub(super) fn new(kind: Kind) -> Error {
         Error {
-            inner: Box::new(ErrorImpl { kind, cause: None }),
+            // VIPER-PATCH(response-bytes): no response byte unless told.
+            inner: Box::new(ErrorImpl {
+                kind,
+                cause: None,
+                response_bytes: false,
+            }),
         }
     }
 
     #[inline]
     pub(super) fn with<C: Into<Cause>>(mut self, cause: C) -> Error {
         self.inner.cause = Some(cause.into());
+        self
+    }
+
+    // VIPER-PATCH(response-bytes): records whether any response byte had
+    // arrived.
+    #[inline]
+    pub(super) fn with_response_bytes(mut self, bytes: bool) -> Error {
+        self.inner.response_bytes = bytes;
         self
     }
 

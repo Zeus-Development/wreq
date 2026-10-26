@@ -111,6 +111,11 @@ where
         should_shutdown: bool,
     ) -> Poll<Result<Dispatched>> {
         Poll::Ready(ready!(self.poll_inner(cx, should_shutdown)).or_else(|e| {
+            // VIPER-PATCH(response-bytes): a failure before the response
+            // head is complete (writing the request, say) also says whether
+            // any response byte had arrived (RFC 9112 section 9.3.1).
+            let bytes = e.received_response_bytes() || self.conn.has_head_bytes();
+            let e = e.with_response_bytes(bytes);
             // Be sure to alert a streaming body of the failure.
             if let Some(mut body) = self.body_tx.take() {
                 body.send_error(Error::new_body("connection error"))
