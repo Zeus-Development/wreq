@@ -22,7 +22,10 @@ use std::{
     time::Duration,
 };
 
-use http::header::{HeaderMap, HeaderValue, USER_AGENT};
+use http::{
+    Uri,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 use tower::{
     BoxError, Layer, Service, ServiceBuilder, ServiceExt,
     retry::{Retry, RetryLayer},
@@ -151,7 +154,12 @@ type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
+pub struct Client(
+    Arc<Either<ClientService, BoxedClientService>>,
+    // VIPER-PATCH(pool-preconnect): the connection layer under the
+    // service, whose pool `Client::preconnect` fills.
+    Arc<HttpClient<Connector, Body>>,
+);
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
 #[must_use]
@@ -415,6 +423,46 @@ impl Client {
         WebSocketRequestBuilder::new(self.request(Method::GET, uri))
     }
 
+    // VIPER-PATCH(pool-preconnect): HTML's "preconnect" and Resource
+    // Hints let a client open connections to an origin ahead of its
+    // requests (HTML, "link type preconnect"); this opens them into the
+    // pool.
+    /// Opens `count` new connections to the origin of `uri` and puts each in
+    /// the connection pool as an idle connection, without sending a request,
+    /// so that later requests to that origin check them out as any idle
+    /// connection.
+    ///
+    /// Each connection takes the route a request to `uri` with the client's
+    /// own options takes: its connector, the proxy chosen for `uri` and its
+    /// tunnel, and TLS; a request's own options (a proxy, TLS options, a
+    /// version, a group) give another pool key, so such a request does not
+    /// take them. The pool's limits apply: a connection past
+    /// `pool_max_idle_per_host` is closed, and an idle one closes after
+    /// `pool_idle_timeout`; without a pool nothing is kept. Over HTTP/2 the
+    /// pool keeps one connection per origin, which the `count` connections
+    /// share.
+    ///
+    /// The future resolves to one outcome per connection, in order: `Ok`
+    /// once the connection is ready for a request, or the error a request
+    /// would have got connecting (`uri` not absolute, the connection, the
+    /// proxy or the TLS handshake failing).
+    pub fn preconnect(
+        &self,
+        uri: Uri,
+        count: usize,
+    ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
+        let connections = (0..count).map(|_| {
+            let (client, uri) = (self.1.clone(), uri.clone());
+            async move {
+                client
+                    .preconnect(uri.clone())
+                    .await
+                    .map_err(|err| Error::request(err).with_uri(uri))
+            }
+        });
+        futures_util::future::join_all(connections)
+    }
+
     /// Executes a `Request`.
     ///
     /// A `Request` can be built manually with `Request::new()` or obtained
@@ -591,6 +639,9 @@ impl ClientBuilder {
                 .build(connector)
         };
 
+        // VIPER-PATCH(pool-preconnect): the connection layer, shared with the service.
+        let preconnector = Arc::new(service.clone());
+
         // Configured client service with layers
         let client = {
             let service = ServiceBuilder::new()
@@ -644,7 +695,7 @@ impl ClientBuilder {
             }
         };
 
-        Ok(Client(Arc::new(client)))
+        Ok(Client(Arc::new(client), preconnector)) // VIPER-PATCH(pool-preconnect)
     }
 
     // Runtime options

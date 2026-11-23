@@ -209,6 +209,34 @@ where
         Box::pin(this.send_request(req, descriptor).map_err(Into::into))
     }
 
+    // VIPER-PATCH(pool-preconnect): opens a new connection to the origin of
+    // `uri` through the route a request with the client's own options takes
+    // (its connector, proxy tunnel and TLS), without sending a request, and
+    // puts it in the pool as an idle connection, within the pool's limits,
+    // for a later request to that origin to check out as any idle one. Over
+    // HTTP/2 the pool keeps one connection per destination: while one is
+    // being made, a second preconnect waits for it and shares it.
+    pub(crate) async fn preconnect(&self, uri: Uri) -> Result<(), Error> {
+        let mut req = Request::new(());
+        *req.uri_mut() = uri;
+        let uri = normalize_uri(&mut req, false)?;
+        let RequestOptions {
+            group,
+            proxy,
+            version,
+            tls_options,
+            socket_bind_options,
+            ..
+        } = RequestOptions::default();
+        let descriptor =
+            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options);
+        let mut this = self.clone();
+        this.config.new_connection = true;
+        let mut pooled = this.connection_for(descriptor).await?;
+        // Ready to send, so that dropping it below puts it in the pool.
+        std::future::poll_fn(|cx| pooled.poll_ready(cx)).await
+    }
+
     async fn send_request(
         self,
         mut req: Request<B>,
