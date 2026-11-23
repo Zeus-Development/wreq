@@ -68,6 +68,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `h2-proxy-connect` | when that proxy selects `h2`, each tunnel is a `CONNECT` stream of one HTTP/2 connection to the proxy, shared by the client's tunnels through it while it stays open (RFC 9113 section 8.5); another selection, or none, gets an HTTP/1.1 `CONNECT` on that connection | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 two_tunnels_share_one_http2_connection_to_the_proxy` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connection-reuse` | a request that failed on a connection checked out of the pool says so (`Error::is_connection_reused`), and a request may ask for a new connection instead of an idle one (`RequestBuilder::new_connection`; over HTTP/2 with the limits in its section), so a client can send an idempotent request again on a new connection after its connection closed before the response (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_connection_reuse.rs`; Viper: `viper-net::resend a_reused_connection_closed_before_the_response_is_sent_again` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `async-verify-evidence` | the caller's certificate check runs inside the handshake, as the TLS library's custom verification after the library's own chain and name verification (mirrored exactly), sees the stapled OCSP response (RFC 6066 section 8) and the SCT list of the TLS extension (RFC 6962 section 3.3), and may answer later through a future, the handshake waiting without blocking its thread (the library's `ssl_verify_retry`); its refusal ends the handshake with an alert, before any request byte | none | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_later_answer_lets_another_sessions_fetch_complete_meanwhile` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `pool-preconnect` | a client may open connections to an origin ahead of its requests (`Client::preconnect`): each takes the route a request with the client's own options takes (connector, proxy tunnel, TLS), joins the pool as an idle connection within its limits and reports its outcome, and a later request checks it out as any idle connection (HTML's `preconnect` link type) | none | fork: `tests/viper_pool_preconnect.rs`; Viper: `viper-net::preconnect a_preconnected_connection_serves_the_next_request` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -222,6 +223,29 @@ hook nothing changes: the handshake is driven as before. The patch adds the
 `foreign-types` dependency, already in the graph through `btls`, for the
 library's raw pointers.
 
+## pool-preconnect
+
+wreq's pool filled only when a request was sent: a connection was made for
+a request and joined the pool once the request no longer needed it. A
+client that knows it will soon fetch from an origin (HTML's `preconnect`
+link type, a navigation's early connections) could not open connections
+ahead. With the patch, `Client::preconnect(uri, count)` (`src/client.rs`)
+opens `count` new connections to the origin of `uri` through the client's
+connection layer (`HttpClient::preconnect`, `src/client/layer/client.rs`),
+which `Client` now keeps beside its service: each goes through the
+connector with the request options a request without its own options has,
+so the proxy chosen for `uri` and its tunnel and TLS are the request's, and
+skips the idle connections as `new_connection` does. Once it is ready for a
+request it is dropped into the pool as an idle connection, where the
+pool's limits apply (`pool_max_idle_per_host` closes the ones past it,
+`pool_idle_timeout` the ones left idle). Each connection's outcome is
+reported in order: `Ok`, or the error a request would have got connecting,
+with the URI. Over HTTP/2 the pool keeps one connection per destination,
+so the connections share the one being made. A request with its own
+options (a proxy, TLS options, a version, a group) has another pool key
+and does not take them. Nothing else changes: without a call the pool
+fills as before.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -249,3 +273,4 @@ library's raw pointers.
 | V16d-3d | the last commit of this range | the patches `proxy-alpn` and `h2-proxy-connect` |
 | NET-RESEND-1 | the last commit of this range | the patch `connection-reuse` |
 | NET-CERT-SEAM-1 | the last commit of this range | the patch `async-verify-evidence` |
+| WREQ-PRECONNECT-1 | the last commit of this range | the patch `pool-preconnect` |
