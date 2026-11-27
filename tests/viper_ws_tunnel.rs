@@ -52,9 +52,10 @@ async fn serve(mut stream: TcpStream, seen: Arc<Mutex<Vec<Vec<String>>>>) {
 }
 
 /// The heads each proxy connection carried for GETs of
-/// `http://origin.test/`, one with `force_tunnel(true)` per entry of
-/// `forced` that is true, through a recording proxy with credentials.
-async fn heads(forced: &[bool]) -> Vec<Vec<String>> {
+/// `http://origin.test/`, one per entry of `forced`, calling
+/// `force_tunnel` with its value or, for `None`, not at all, through a
+/// recording proxy with credentials.
+async fn heads(forced: &[Option<bool>]) -> Vec<Vec<String>> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -67,7 +68,10 @@ async fn heads(forced: &[bool]) -> Vec<Vec<String>> {
     let proxy = wreq::Proxy::all(&url).unwrap().basic_auth("route", "own");
     let client = Client::builder().proxy(proxy).build().unwrap();
     for &force in forced {
-        let request = client.get("http://origin.test/").force_tunnel(force);
+        let mut request = client.get("http://origin.test/");
+        if let Some(force) = force {
+            request = request.force_tunnel(force);
+        }
         let response = request.send().await.unwrap();
         assert_eq!(response.text().await.unwrap(), "ok");
     }
@@ -81,7 +85,7 @@ fn line(head: &str) -> &str {
 
 #[tokio::test]
 async fn a_forced_tunnel_carries_an_http_request_in_origin_form() {
-    let heads = heads(&[true]).await;
+    let heads = heads(&[Some(true)]).await;
     assert_eq!(heads.len(), 1);
     let [connect, request] = &heads[0][..] else {
         panic!("{heads:?}");
@@ -95,7 +99,7 @@ async fn a_forced_tunnel_carries_an_http_request_in_origin_form() {
 
 #[tokio::test]
 async fn without_it_an_http_request_is_forwarded_on_its_own_connection() {
-    let heads = heads(&[false, true, false]).await;
+    let heads = heads(&[Some(false), Some(true), Some(false)]).await;
     assert_eq!(heads.len(), 2, "{heads:?}");
     let forwarded = &heads[0];
     assert_eq!(forwarded.len(), 2, "{forwarded:?}");
@@ -104,4 +108,17 @@ async fn without_it_an_http_request_is_forwarded_on_its_own_connection() {
     }
     assert_eq!(line(&heads[1][0]), "CONNECT origin.test:80 HTTP/1.1");
     assert_eq!(heads[1].len(), 2, "{heads:?}");
+}
+
+// The ws-tunnel follow-up of WREQ-FORK-3's review: `force_tunnel(false)`
+// alone sets no tunnel fields, so its request pools with one that never
+// called it.
+#[tokio::test]
+async fn force_tunnel_false_alone_pools_with_a_request_that_never_called_it() {
+    let heads = heads(&[None, Some(false), None]).await;
+    assert_eq!(heads.len(), 1, "{heads:?}");
+    assert_eq!(heads[0].len(), 3, "{heads:?}");
+    for head in &heads[0] {
+        assert_eq!(line(head), "GET http://origin.test/ HTTP/1.1");
+    }
 }

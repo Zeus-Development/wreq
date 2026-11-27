@@ -880,7 +880,10 @@ impl RequestBuilder {
         if let Ok(ref mut req) = self.request {
             let options = req.config_mut::<RequestOptions>().get_or_insert_default();
             let ConnectFields(fields, order, _) = options.connect_fields.take().unwrap_or_default();
-            options.connect_fields = Some(ConnectFields(fields, order, tunnel));
+            // VIPER-PATCH(ws-tunnel): fields left all default are none, so
+            // `force_tunnel(false)` alone pools as a request that never called it.
+            let fields = ConnectFields(fields, order, tunnel);
+            options.connect_fields = (fields != ConnectFields::default()).then_some(fields);
         }
         self
     }
