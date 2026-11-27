@@ -81,10 +81,11 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `negotiated-alpn` | `Conn::negotiated_h2` tells a connector layer whether a connection it made negotiated HTTP/2 through ALPN (RFC 7301), so a layer racing connections to one origin can give up the others once one is shared | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_connector_layer_reads_whether_a_connection_negotiated_http2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `local-port-bind` | a caller may choose each TCP socket's source port (`ClientBuilder::tcp_source_port`): asked with the peer (a proxy's address for a connection through it) and the try number, the port is bound before connect, asked again on `EADDRINUSE` or `EACCES`, and left to the OS once the caller answers `None`; a connector layer reads a connection's local and peer addresses (`Conn::addresses`), so a browser that randomizes source ports per peer can do so and learn when each closes | none | fork: `tests/viper_source_port.rs`; Viper: `viper-net::wreq_pin a_source_port_function_binds_each_socket_before_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `ws-tunnel` | a request may force its connection through an HTTP or HTTPS proxy to be a `CONNECT` tunnel for an `http` URL too (`RequestBuilder::force_tunnel`), with no TLS inside the tunnel, the request in origin form and without the proxy's credentials, keyed apart in the pool, so a WebSocket client tunnels a `ws:` handshake as RFC 6455 section 4.1 recommends | `adr:net-websocket-http-proxy` | fork: `tests/viper_ws_tunnel.rs`; Viper: `viper-net::websocket a_ws_handshake_through_an_http_proxy_goes_through_a_tunnel` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
-| `connect-superseded` | a connector layer can read the key a connection will be pooled under (`Unnameable::pool_key`, an opaque `PoolKey`) and give up an attempt with `Superseded` once another of its key negotiated HTTP/2; the request, or preconnect, then waits for the connection that won instead of failing, or starts again when no connection of its key is being made or idle | `adr:net-request-race-abort` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::preconnect_race a_requests_attempt_is_given_up_once_another_negotiates_h2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `connect-superseded` | a connector layer can read the key a connection will be pooled under (`Unnameable::pool_key`, an opaque `PoolKey`) and give up an attempt with `Superseded` once another of its key negotiated HTTP/2; the request, or preconnect, then waits for the connection that won instead of failing, or starts again when no connection of its key is being made and none is open and idle | `adr:net-request-race-abort` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::preconnect_race a_requests_attempt_is_given_up_once_another_negotiates_h2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connect-407-retry` | an HTTP proxy's 407 answer to a tunnel's HTTP/1.1 `CONNECT` that leaves the connection open (HTTP/1.1 without `Connection: close` or `Proxy-Connection: close`, one all-digit `Content-Length` of at most 64 KiB and no `Transfer-Encoding`; RFC 9112 sections 9.3 and 6.3) keeps it, its body read, on the failure (`ProxyFailure::connection`, a `ProxyConnection`), and a retry with credentials given it (`RequestBuilder::proxy_connection`) writes its `CONNECT` on it when it goes through the same proxy to the same authority (RFC 9110 section 15.5.8); it closes when the last handle drops, or 30 seconds after the 407 | none | fork: `tests/viper_connect_retry.rs`; Viper: `viper-net::proxy_auth_retry an_http1_tunnels_retry_goes_on_the_connection_its_407_came_on` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `h2-proxy-profile` | the HTTP/2 connection to a proxy that selected `h2` opens with the client's HTTP/2 options (`ClientBuilder::http2_options`: SETTINGS and their order, the connection window, the HEADERS priority and pseudo-header order), as its connections to origins do, instead of wreq-proto's defaults | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_auth_retry an_http2_tunnels_retry_is_a_new_stream_of_a_connection_opened_as_chromes` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `h2-proxy-addresses` | each tunnel over a shared HTTP/2 proxy connection gives that connection's socket addresses through `Connected`, so `Conn::addresses` and a response's `remote_addr` read the proxy's socket as through an HTTP/1.1 tunnel, never the proxy's ALPN | `adr:net-source-port-h2-proxy` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_h2 an_http2_proxy_connections_source_port_is_held_while_it_is_open` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `h2-lock-notice` | a connector layer can give a connection it made a notice (`Conn::on_h2_lock`) that wreq calls once the pool holds the connection's key's HTTP/2 lock for it, right before its HTTP/2 handshake, so a layer racing attempts to one destination gives up the others no earlier than the pool can serve them, and an attempt starting before then is given up too | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net stage::race::tests::an_attempt_joining_before_the_http2_lock_is_given_up` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -481,7 +482,10 @@ layer gives up fails with `wreq::Superseded`; `Error::new` turns it into
 take `Pool::superseded` (`src/client/layer/client/pool.rs`): a checkout
 waiting for the HTTP/2 connection being made for the key, whose lock's
 release answers the waiter either way, or taking an idle one, and `None`
-when neither exists. A checkout that ends without a connection starts the
+when neither exists. Only an open, unexpired idle entry counts, as
+`IdlePopper` takes one (WREQ-SUPERSEDED-2): a closed or expired entry
+would leave the checkout waiting where no connection comes, until the
+request's deadline. A checkout that ends without a connection starts the
 request again, as a closed checkout does (`retry_canceled_requests`), so a
 superseded request never waits where no connection can come. Without the
 error nothing changes.
@@ -532,6 +536,26 @@ keeps it with the shared connection and gives it to each tunnel's
 tunnel's), so a caller can tie a chosen source port to the connection and
 reads the proxy as the response's peer.
 
+## h2-lock-notice
+
+A connector layer racing attempts to one destination (`connect-superseded`)
+could give the others up only when its own attempt returned with `h2`
+negotiated (`negotiated-alpn`). wreq takes the pool's HTTP/2 lock for the
+key a moment later, in `connect_to` (`src/client/layer/client.rs`), and
+until then the pool does not serve the key: an attempt starting in that gap
+was not given up and could open one more connection, which `put` then
+drops as a second idle HTTP/2 connection. With the patch,
+`Conn::on_h2_lock` (`src/conn.rs`) keeps a layer's notice on the
+connection, and `Connection::h2_locked`, a trait method that does nothing
+by default, is called by `connect_to` once the lock is the connection's:
+after ALPN chose `h2` and `Connecting::alpn_h2` took it, or at once for an
+HTTP/2-only client, right before the HTTP/2 handshake. `Conn` calls its
+notice there, once; an attempt that lost the lock to another connection of
+its key, or negotiated HTTP/1.1, never calls it. A layer that gives up the
+others from the notice gives them up when `Pool::superseded` finds the lock
+held, so their requests wait for that connection. Without a notice nothing
+changes.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -567,3 +591,4 @@ reads the proxy as the response's peer.
 | WREQ-FORK-3 | the last commit of this range | the patches `local-port-bind` and `ws-tunnel` |
 | WREQ-FORK-5 | the last commit of this range | the patch `connect-superseded` and the follow-ups of `ws-tunnel` |
 | WREQ-PROXY-CONN-1 | the last commit of this range | the patches `connect-407-retry`, `h2-proxy-profile` and `h2-proxy-addresses` |
+| WREQ-SUPERSEDED-2 | the last commit of this range | the patch `h2-lock-notice` and the follow-up of `connect-superseded` |
