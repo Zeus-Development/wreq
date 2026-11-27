@@ -194,6 +194,7 @@ where
                 http2_options,
                 socket_bind_options,
                 new_connection, // VIPER-PATCH(connection-reuse)
+                connect_fields, // VIPER-PATCH(request-connect-fields)
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
             this.config.new_connection = new_connection; // VIPER-PATCH(connection-reuse)
 
@@ -204,7 +205,9 @@ where
                 this.h2_builder = this.h2_builder.options(opts);
             }
 
-            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
+            // VIPER-PATCH(request-connect-fields): with the tunnel's fields.
+            let (tls, socket) = (tls_options, socket_bind_options);
+            ConnectionDescriptor::new(uri, group, proxy, version, tls, socket, connect_fields)
         };
 
         Box::pin(this.send_request(req, descriptor).map_err(Into::into))
@@ -234,8 +237,9 @@ where
         if let Some(own) = in_group {
             group.request(own);
         }
-        let descriptor =
-            ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options);
+        // VIPER-PATCH(request-connect-fields): a preconnect sets none.
+        let (tls, socket) = (tls_options, socket_bind_options);
+        let descriptor = ConnectionDescriptor::new(uri, group, proxy, version, tls, socket, None);
         let mut this = self.clone();
         this.config.new_connection = true;
         let mut pooled = this.connection_for(descriptor).await?;

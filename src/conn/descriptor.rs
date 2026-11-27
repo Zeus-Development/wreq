@@ -7,10 +7,14 @@ use std::{
     },
 };
 
-use http::{Uri, Version};
+// VIPER-PATCH(request-connect-fields): the fields' map.
+use http::{HeaderMap, Uri, Version};
 use lru::DefaultHasher;
 
-use crate::{conn::net::SocketBindOptions, group::Group, proxy::Matcher, tls::TlsOptions};
+use crate::{
+    client::layer::config::ConnectFields, conn::net::SocketBindOptions, group::Group,
+    proxy::Matcher, tls::TlsOptions,
+};
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -32,6 +36,8 @@ pub(crate) struct ConnectionDescriptor {
     proxy: Option<Matcher>,
     tls_options: Option<TlsOptions>,
     socket_bind: Option<SocketBindOptions>,
+    // VIPER-PATCH(request-connect-fields): the tunnel's `CONNECT` fields.
+    connect_fields: Option<ConnectFields>,
     connection_id: ConnectionId,
 }
 
@@ -80,13 +86,16 @@ impl ConnectionDescriptor {
         version: Option<Version>,
         tls_options: Option<TlsOptions>,
         socket_bind: Option<SocketBindOptions>,
+        // VIPER-PATCH(request-connect-fields): part of the key.
+        connect_fields: Option<ConnectFields>,
     ) -> ConnectionDescriptor {
         let connection_id = {
             group
                 .uri(uri.clone())
                 .version(version)
                 .proxy(proxy.clone())
-                .socket_bind(socket_bind.clone());
+                .socket_bind(socket_bind.clone())
+                .connect_fields(connect_fields.clone());
             ConnectionId(Arc::new((group, AtomicU64::new(u64::MIN))))
         };
 
@@ -96,6 +105,7 @@ impl ConnectionDescriptor {
             version,
             tls_options,
             socket_bind,
+            connect_fields,
             connection_id,
         }
     }
@@ -133,6 +143,13 @@ impl ConnectionDescriptor {
     #[inline]
     pub(crate) fn proxy(&self) -> Option<&Matcher> {
         self.proxy.as_ref()
+    }
+
+    // VIPER-PATCH(request-connect-fields): the tunnel's `CONNECT` fields.
+    /// Return the fields of the tunnel's `CONNECT`, if the request set any.
+    #[inline]
+    pub(crate) fn connect_headers(&self) -> Option<&HeaderMap> {
+        self.connect_fields.as_ref().map(|fields| &fields.0)
     }
 
     /// Return a reference to the [`SocketBindOptions`].

@@ -1,10 +1,12 @@
 use std::{
+    // VIPER-PATCH(request-connect-fields): the fields' hash.
+    hash::{Hash, Hasher},
     sync::Arc,
     task::{Context, Poll},
 };
 
 use futures_util::future::{self, Either, Ready};
-use http::{HeaderMap, Request, Response, Version};
+use http::{HeaderMap, HeaderName, Request, Response, Version};
 use tower::{Layer, Service};
 use wreq_proto::{http1::Http1Options, http2::Http2Options};
 
@@ -53,6 +55,28 @@ impl VersionFields {
     }
 }
 
+// VIPER-PATCH(request-connect-fields): the fields of the `CONNECT` that
+// opens one request's tunnel through an HTTP proxy, part of its connection's
+// key.
+/// Fields of the `CONNECT` request of a request's tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectFields(pub HeaderMap);
+
+impl Hash for ConnectFields {
+    /// By name, in sorted order, then each name's values in order, as
+    /// `HeaderMap`'s equality compares them.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut names: Vec<&HeaderName> = self.0.keys().collect();
+        names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        for name in names {
+            name.as_str().hash(state);
+            for value in self.0.get_all(name) {
+                value.as_bytes().hash(state);
+            }
+        }
+    }
+}
+
 /// Per-request configuration for proxy, protocol, and transport options.
 /// Overrides client defaults for a single request.
 #[derive(Debug, Default, Clone)]
@@ -68,6 +92,8 @@ pub(crate) struct RequestOptions {
     // VIPER-PATCH(connection-reuse): open a new connection instead of
     // checking out an idle one.
     pub new_connection: bool,
+    // VIPER-PATCH(request-connect-fields): the tunnel's `CONNECT` fields.
+    pub connect_fields: Option<ConnectFields>,
 }
 
 /// Configuration for the [`ConfigService`].

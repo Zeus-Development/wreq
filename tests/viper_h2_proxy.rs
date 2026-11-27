@@ -95,12 +95,18 @@ enum Refusal {
     Status(StatusCode),
 }
 
-/// A loopback HTTPS proxy: its TCP connections and the ALPN lists offered.
+/// A loopback HTTPS proxy: its TCP connections, the ALPN lists offered and
+/// each `CONNECT`'s `Proxy-Authorization`.
 struct Proxy {
     url: String,
     accepted: Arc<AtomicUsize>,
     offers: Arc<Mutex<Vec<Vec<u8>>>>,
+    // VIPER-PATCH(request-connect-fields): what each `CONNECT` carried.
+    connects: Connects,
 }
+
+/// Each `CONNECT`'s `Proxy-Authorization` value, in order.
+type Connects = Arc<Mutex<Vec<Option<String>>>>;
 
 async fn proxy(select: &'static [u8], refused: Option<(u16, Refusal)>) -> Proxy {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -108,16 +114,24 @@ async fn proxy(select: &'static [u8], refused: Option<(u16, Refusal)>) -> Proxy 
     let (accepted, offers) = (Arc::new(AtomicUsize::new(0)), Arc::default());
     let context = context(select, Arc::clone(&offers));
     let count = Arc::clone(&accepted);
+    let connects = Connects::default();
+    let seen = Arc::clone(&connects);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             count.fetch_add(1, Ordering::SeqCst);
             let tls = accept_tls(&context, stream).await;
+            let seen = Arc::clone(&seen);
             if tls.ssl().selected_alpn_protocol() == Some(b"h2".as_slice()) {
-                let serve = service_fn(move |request| connect(request, refused));
+                let serve = service_fn(move |request: Request<Incoming>| {
+                    let field = request.headers().get("proxy-authorization");
+                    let field = field.map(|value| value.to_str().unwrap().to_owned());
+                    seen.lock().unwrap().push(field);
+                    connect(request, refused)
+                });
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
                 tokio::spawn(conn.serve_connection(TokioIo::new(tls), serve));
             } else {
-                tokio::spawn(connect_http1(tls));
+                tokio::spawn(connect_http1(tls, seen));
             }
         }
     });
@@ -125,6 +139,7 @@ async fn proxy(select: &'static [u8], refused: Option<(u16, Refusal)>) -> Proxy 
         url,
         accepted,
         offers,
+        connects,
     }
 }
 
@@ -160,12 +175,18 @@ async fn connect(
 }
 
 /// One HTTP/1.1 `CONNECT`, answered 200 and relayed.
-async fn connect_http1(mut tls: SslStream<TcpStream>) {
+async fn connect_http1(mut tls: SslStream<TcpStream>, seen: Connects) {
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         head.push(tls.read_u8().await.unwrap());
     }
     let head = String::from_utf8(head).unwrap();
+    let field = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(": ")?;
+        name.eq_ignore_ascii_case("proxy-authorization")
+            .then(|| value.to_owned())
+    });
+    seen.lock().unwrap().push(field);
     let target = head
         .strip_prefix("CONNECT ")
         .unwrap()
@@ -280,4 +301,38 @@ async fn without_a_list_no_alpn_is_offered_and_http1_one_is() {
         first.to_string()
     );
     assert_eq!(*proxy.offers.lock().unwrap(), [HTTP1_ONLY.to_vec()]);
+}
+
+// VIPER-PATCH(request-connect-fields): a request's own `CONNECT` fields
+// replace the proxy's credentials on its tunnel only, which serves only
+// requests with the same fields, over HTTP/2 and HTTP/1.1 alike.
+#[tokio::test]
+async fn a_requests_connect_fields_go_on_its_own_tunnel_only() {
+    for (select, alpn) in [(H2_AND_HTTP1, BOTH), (HTTP1_ONLY, &[AlpnProtocol::HTTP1][..])] {
+        let origin = origin().await;
+        let proxy = proxy(select, None).await;
+        let config = wreq::Proxy::all(&proxy.url).unwrap();
+        let client = Client::builder()
+            .proxy(config.basic_auth("route", "own").alpn_protocols(alpn))
+            .tls_cert_verification(false)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{origin}/");
+        let mut fields = http::HeaderMap::new();
+        let answer = http::HeaderValue::from_static("Basic YW5zd2VyOmdpdmVu");
+        fields.insert("proxy-authorization", answer);
+        for given in [None, Some(&fields), None, Some(&fields)] {
+            let request = client.get(&url);
+            let request = match given {
+                Some(fields) => request.connect_headers(fields.clone()),
+                None => request,
+            };
+            let body = request.send().await.unwrap().text().await.unwrap();
+            assert_eq!(body, origin.to_string());
+        }
+        let route = Some("Basic cm91dGU6b3du".to_owned());
+        let given = Some("Basic YW5zd2VyOmdpdmVu".to_owned());
+        // Two tunnels, each reused by the later request with its fields.
+        assert_eq!(*proxy.connects.lock().unwrap(), [route, given]);
+    }
 }

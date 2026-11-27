@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 use http::{Uri, Version};
 use name::GroupId;
 
-use crate::{conn::net::SocketBindOptions, proxy::Matcher};
+// VIPER-PATCH(request-connect-fields): a tunnel's `CONNECT` fields.
+use crate::{
+    client::layer::config::ConnectFields, conn::net::SocketBindOptions, proxy::Matcher,
+};
 
 macro_rules! impl_group_variants {
     ($($name:ident $(($ty:ty))?,)*) => {
@@ -47,6 +50,8 @@ impl_group_variants! {
     Version(Version),
     Proxy(Matcher),
     SocketBind(Option<SocketBindOptions>),
+    // VIPER-PATCH(request-connect-fields): a tunnel's `CONNECT` fields.
+    ConnectFields(ConnectFields),
 }
 
 /// A logical identifier for request grouping.
@@ -90,6 +95,14 @@ impl Group {
     #[inline]
     pub(crate) fn socket_bind(&mut self, opts: Option<SocketBindOptions>) -> &mut Self {
         self.extend(GroupKey::SocketBind, GroupVariant::SocketBind(opts))
+    }
+
+    // VIPER-PATCH(request-connect-fields): a tunnel opened with a request's
+    // own `CONNECT` fields serves only requests with the same fields.
+    /// Groups the request by the fields of its tunnel's `CONNECT`.
+    #[inline]
+    pub(crate) fn connect_fields(&mut self, fields: Option<ConnectFields>) -> &mut Self {
+        self.extend(GroupKey::ConnectFields, fields.map(GroupVariant::ConnectFields))
     }
 
     /// Creates a nested request group.

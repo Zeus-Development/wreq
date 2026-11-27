@@ -430,12 +430,24 @@ impl TransportConnector {
                             tunnel = tunnel.with_headers(headers.clone());
                         }
 
+                        // VIPER-PATCH(request-connect-fields): the request's
+                        // own fields, in place of the proxy's of their names.
+                        let fields = descriptor.connect_headers().cloned();
+                        if let Some(fields) = fields.clone() {
+                            tunnel = tunnel.with_headers(fields);
+                        }
+
                         // VIPER-PATCH(h2-proxy-connect): a CONNECT stream, else
                         // HTTP/1.1 on the connection made with the list.
                         if let Some(alpn) = h2_alpn {
                             let shared = &self.config.h2_proxies;
-                            let opened =
-                                proxy::h2::open(shared, &proxy, alpn, connector.clone(), &uri);
+                            let opened = proxy::h2::open(
+                                shared,
+                                &proxy,
+                                (alpn, fields.as_ref()),
+                                connector.clone(),
+                                &uri,
+                            );
                             match opened.await.map_err(proxy::failure::ProxyFailure::from)? {
                                 proxy::h2::Opened::Stream(stream) => {
                                     let conn = EstablishedConn::new(stream, descriptor);

@@ -25,7 +25,8 @@ use super::{
     Body, Client, IntoEmulation, Response,
     future::Pending,
     layer::{
-        config::{DefaultHeaders, RequestOptions, VersionFields},
+        // VIPER-PATCH(request-connect-fields): a tunnel's `CONNECT` fields.
+        config::{ConnectFields, DefaultHeaders, RequestOptions, VersionFields},
         timeout::TimeoutOptions,
     },
 };
@@ -824,6 +825,25 @@ impl RequestBuilder {
             crate::util::replace_headers(req.headers_mut(), headers.clone());
             let versions = versions.to_vec();
             (req.extensions_mut()).insert(VersionFields { versions, headers });
+        }
+        self
+    }
+
+    // VIPER-PATCH(request-connect-fields): a client answering a proxy's
+    // challenge to `CONNECT` (RFC 9110 sections 9.3.6 and 11.7.2) sends the
+    // credentials on that request's tunnel only.
+    /// Sends `headers` on the `CONNECT` request that opens this request's
+    /// tunnel through an HTTP proxy, over HTTP/1.1 or as an HTTP/2 stream, in
+    /// place of the proxy's own fields of their names (its credentials, its
+    /// custom headers). They are part of the connection's pool key, so the
+    /// tunnel serves only requests with the same fields. A request that is
+    /// forwarded by the proxy, goes through a SOCKS proxy or goes direct does
+    /// not send them. Without it, nothing changes.
+    pub fn connect_headers(mut self, headers: HeaderMap) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            req.config_mut::<RequestOptions>()
+                .get_or_insert_default()
+                .connect_fields = Some(ConnectFields(headers));
         }
         self
     }

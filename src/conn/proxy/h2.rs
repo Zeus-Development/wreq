@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use http::{Method, Request, StatusCode, Uri, header::PROXY_AUTHORIZATION};
+use http::{HeaderMap, Method, Request, StatusCode, Uri, header::PROXY_AUTHORIZATION};
 use http_body_util::Empty;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::{BoxError, Service};
@@ -46,6 +46,9 @@ pub(crate) enum Opened<T> {
     Http1(T),
 }
 
+/// VIPER-PATCH(request-connect-fields): `fields` are the request's own
+/// `CONNECT` fields, in place of the proxy's of their names.
+///
 /// The tunnel through `proxy` to `dst`'s authority: a stream of the proxy's
 /// shared HTTP/2 connection, opened with the proxy's ALPN list if none is
 /// open. An error is a [`TunnelError`], as for an HTTP/1.1 tunnel: the
@@ -55,7 +58,7 @@ pub(crate) enum Opened<T> {
 pub(crate) async fn open<S, T>(
     shared: &Shared,
     proxy: &Intercept,
-    alpn: &[AlpnProtocol],
+    (alpn, fields): (&[AlpnProtocol], Option<&HeaderMap>),
     mut connector: HttpsConnector<S>,
     dst: &Uri,
 ) -> Result<Opened<MaybeHttpsStream<T>>, TunnelError>
@@ -94,6 +97,10 @@ where
     let mut request = request.body(Empty::new()).map_err(failed)?;
     if let Some(headers) = proxy.custom_headers() {
         request.headers_mut().extend(headers.clone());
+    }
+    // VIPER-PATCH(request-connect-fields): the request's own fields.
+    if let Some(fields) = fields {
+        request.headers_mut().extend(fields.clone());
     }
     let response = sender
         .try_send_request(request)
