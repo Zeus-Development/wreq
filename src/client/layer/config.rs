@@ -59,7 +59,8 @@ impl VersionFields {
 // opens one request's tunnel through an HTTP proxy, part of its connection's
 // key.
 /// Fields of the `CONNECT` request of a request's tunnel.
-#[derive(Debug, Clone, Default)] // VIPER-PATCH(ws-tunnel): and a default
+// VIPER-PATCH(connect-head-fields): equality below; VIPER-PATCH(ws-tunnel): a default.
+#[derive(Debug, Clone, Default)]
 // VIPER-PATCH(connect-head-fields): and the head's order and case.
 // VIPER-PATCH(ws-tunnel): and whether an `http` destination tunnels too.
 pub(crate) struct ConnectFields(pub HeaderMap, pub Option<OrigHeaderMap>, pub bool);
