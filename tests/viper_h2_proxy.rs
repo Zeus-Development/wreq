@@ -782,7 +782,9 @@ fn settings(payload: &[u8]) -> Vec<(u16, u32)> {
 /// HEADERS priority.
 #[tokio::test]
 async fn an_http2_proxy_connection_opens_with_the_clients_options() {
-    use wreq::http2::{Http2Options, SettingId, SettingsOrder, StreamDependency, StreamId};
+    use wreq::http2::{
+        Http2Options, PseudoId, PseudoOrder, SettingId, SettingsOrder, StreamDependency, StreamId,
+    };
     let (url, frames) = recording_proxy().await;
     let order = [
         SettingId::HeaderTableSize,
@@ -798,6 +800,11 @@ async fn an_http2_proxy_connection_opens_with_the_clients_options() {
         .initial_connection_window_size(15_728_640)
         .settings_order(SettingsOrder::builder().extend(order).build())
         .headers_stream_dependency(StreamDependency::new(StreamId::from(0), 146, true))
+        .headers_pseudo_order(
+            PseudoOrder::builder()
+                .extend([PseudoId::Authority, PseudoId::Method])
+                .build(),
+        )
         .build();
     let config = wreq::Proxy::all(&url).unwrap().alpn_protocols(BOTH);
     let client = Client::builder()
@@ -819,6 +826,9 @@ async fn an_http2_proxy_connection_opens_with_the_clients_options() {
     let headers = frames.last().unwrap();
     assert_eq!(headers.1 & 0x20, 0x20, "with a priority");
     assert_eq!(headers.3[..5], [0x80, 0, 0, 0, 146], "exclusive on 0, weight 147");
+    // The first field names HPACK's static entry 1, `:authority`, not 2,
+    // `:method` (RFC 7541 appendix A), in any literal or indexed form.
+    assert_eq!(headers.3[5] & 0x0f, 1, "the options' pseudo-header order");
 }
 
 // VIPER-PATCH(h2-proxy-addresses): what a connector layer reads of each

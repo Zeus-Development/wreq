@@ -44,13 +44,18 @@ struct Proxy {
 }
 
 /// One connection: a challenge without credentials, else 200 and one
-/// request served; the connection's end is reported.
-async fn serve(mut stream: TcpStream, number: usize, (challenge, proxy): (&str, Record)) {
+/// request served; the connection's end is reported. With `closing`, the
+/// first connection closes right after its challenge.
+async fn serve(mut stream: TcpStream, number: usize, (challenge, closing, proxy): Serving) {
     while let Some(head) = read_head(&mut stream).await {
         let authorized = head.to_ascii_lowercase().contains("proxy-authorization");
         proxy.0.lock().unwrap().push((number, head));
         if !authorized {
             stream.write_all(challenge.as_bytes()).await.unwrap();
+            if closing && number == 0 {
+                stream.shutdown().await.unwrap();
+                break;
+            }
             continue;
         }
         stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
@@ -66,7 +71,15 @@ type Record = (
     mpsc::UnboundedSender<usize>,
 );
 
+type Serving = (&'static str, bool, Record);
+
 async fn proxy(challenge: &'static str) -> Proxy {
+    proxy_closing(challenge, false).await
+}
+
+/// A proxy whose first connection closes after its challenge when
+/// `closing`.
+async fn proxy_closing(challenge: &'static str, closing: bool) -> Proxy {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let heads = Arc::<Mutex<Vec<_>>>::default();
@@ -76,7 +89,7 @@ async fn proxy(challenge: &'static str) -> Proxy {
         let mut number = 0;
         while let Ok((stream, _)) = listener.accept().await {
             let record = (Arc::clone(&record.0), record.1.clone());
-            tokio::spawn(serve(stream, number, (challenge, record)));
+            tokio::spawn(serve(stream, number, (challenge, closing, record)));
             number += 1;
         }
     });
@@ -140,6 +153,10 @@ async fn a_407_that_may_close_keeps_no_connection() {
         "HTTP/1.1 407 No\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "HTTP/1.1 407 No\r\nContent-Length: 65537\r\n\r\n",
         "HTTP/1.1 407 No\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 407 No\r\nProxy-Connection: close\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 407 No\r\nContent-Length: +0\r\n\r\n",
+        // More than the body: the proxy sent a byte after it.
+        "HTTP/1.1 407 No\r\nContent-Length: 0\r\n\r\nX",
         "HTTP/1.1 407 No\r\n\r\n",
         "HTTP/1.0 407 No\r\nContent-Length: 0\r\n\r\n",
     ] {
@@ -169,6 +186,19 @@ async fn proxy_two(proxy: &Proxy) -> Client {
     let config = wreq::Proxy::all(&proxy.url).unwrap();
     let config = config.basic_auth("route", "own");
     Client::builder().proxy(config).build().unwrap()
+}
+
+#[tokio::test]
+async fn a_kept_connection_the_proxy_closed_is_not_taken() {
+    let mut proxy = proxy_closing(CHALLENGE, true).await;
+    let client = client(&proxy);
+    let kept = challenged(&client, "origin.test").await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(10), proxy.closed.recv());
+    assert_eq!(closed.await.unwrap(), Some(0));
+    // The end of the stream reaches the client's socket.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(retry(&client, "origin.test", kept).await, "ok");
+    assert_eq!(connections(&proxy), [0, 1], "a new connection");
 }
 
 #[tokio::test]

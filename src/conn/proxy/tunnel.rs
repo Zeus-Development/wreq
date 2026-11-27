@@ -351,8 +351,10 @@ const DRAINED: usize = 64 * 1024;
 
 // VIPER-PATCH(connect-407-retry): the body length of a 407 whose connection
 // stays open after it: HTTP/1.1 without `Connection: close` (RFC 9112
-// section 9.3), its body framed by one `Content-Length` of at most `DRAINED`
-// bytes and no `Transfer-Encoding` (section 6.3); `None` otherwise.
+// section 9.3) or the `Proxy-Connection: close` proxies still send, its body
+// framed by one `Content-Length` of digits only (RFC 9110 section 8.6) of at
+// most `DRAINED` bytes and no `Transfer-Encoding` (section 6.3); `None`
+// otherwise.
 fn reusable(res: &httparse::Response<'_, '_>) -> Option<usize> {
     let named = |name: &'static str| {
         let headers = res.headers.iter();
@@ -362,7 +364,10 @@ fn reusable(res: &httparse::Response<'_, '_>) -> Option<usize> {
         let mut tokens = header.value.split(|byte| *byte == b',');
         tokens.any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
     };
-    if res.version != Some(1) || named("connection").any(close) {
+    let closes = named("connection")
+        .chain(named("proxy-connection"))
+        .any(close);
+    if res.version != Some(1) || closes {
         return None;
     }
     if named("transfer-encoding").next().is_some() {
@@ -370,7 +375,11 @@ fn reusable(res: &httparse::Response<'_, '_>) -> Option<usize> {
     }
     let mut lengths = named("content-length");
     let length = std::str::from_utf8(lengths.next()?.value).ok()?;
-    let length: usize = length.trim().parse().ok()?;
+    let length = length.trim();
+    if length.is_empty() || !length.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let length: usize = length.parse().ok()?;
     (lengths.next().is_none() && length <= DRAINED).then_some(length)
 }
 
