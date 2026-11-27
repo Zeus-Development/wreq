@@ -34,7 +34,8 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::OnPreserveHeader,
+    // VIPER-PATCH(h2-informational): a request's 1xx callback.
+    ext::{OnInformational, OnPreserveHeader},
     proto::{headers, Dispatched},
     rt::{bounds::Http2ClientConnExec, Time},
     upgrade::{self, Upgraded},
@@ -314,6 +315,8 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<Incoming>>,
+    // VIPER-PATCH(h2-informational): the request's 1xx callback.
+    on_informational: Option<OnInformational>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
@@ -449,6 +452,7 @@ where
                     ping: Some(ping),
                     send_stream: Some(send_stream),
                     cancel_tx: Some(cancel_tx),
+                    on_informational: f.on_informational,
                 },
                 call_back: Some(f.cb),
             },
@@ -485,6 +489,9 @@ pin_project! {
         #[pin]
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
         cancel_tx: Option<oneshot::Sender<()>>,
+        // VIPER-PATCH(h2-informational): called with each 1xx response
+        // that comes before the final one.
+        on_informational: Option<OnInformational>,
     }
 }
 
@@ -506,6 +513,17 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
+
+        // VIPER-PATCH(h2-informational): each interim (1xx) response that
+        // came before the final one goes to the request's callback, in the
+        // order received, as the HTTP/1 client does (RFC 9110 section 15.2,
+        // RFC 9113 section 8.1). Without a callback they are skipped, as
+        // before.
+        if let Some(callback) = this.on_informational.as_ref() {
+            while let Poll::Ready(Some(Ok(res))) = this.fut.as_mut().poll_informational(cx) {
+                callback.call(res);
+            }
+        }
 
         let result = ready!(this.fut.poll(cx));
 
@@ -610,6 +628,9 @@ where
                         }
                     }
 
+                    // VIPER-PATCH(h2-informational): taken as the HTTP/1 client does.
+                    let on_informational = req.extensions_mut().remove::<OnInformational>();
+
                     // Sort headers
                     if let Some(header_sort) = req.extensions_mut().remove::<OnPreserveHeader>() {
                         header_sort.call(req.headers_mut());
@@ -649,6 +670,7 @@ where
                         body_tx,
                         body,
                         cb,
+                        on_informational,
                     };
 
                     // Check poll_ready() again.
