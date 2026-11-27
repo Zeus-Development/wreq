@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::{BoxError, Service};
 use wreq_proto::{
     conn::http2::{Builder, SendRequest},
+    // VIPER-PATCH(connect-head-fields): sorts the `CONNECT` stream's fields.
+    ext::OnPreserveHeaderCallback,
     rt::Executor as _,
     upgrade::{self, Upgraded},
 };
@@ -26,6 +28,8 @@ use super::tunnel::TunnelError;
 use crate::{
     conn::{Connected, Connection, TlsConn, tls_info::TlsInfoFactory},
     ext::UriExt,
+    // VIPER-PATCH(connect-head-fields): the `CONNECT` head's order.
+    header::OrigHeaderMap,
     proxy::matcher::Intercept,
     rt::Executor,
     tls::{
@@ -58,7 +62,8 @@ pub(crate) enum Opened<T> {
 pub(crate) async fn open<S, T>(
     shared: &Shared,
     proxy: &Intercept,
-    (alpn, fields): (&[AlpnProtocol], Option<&HeaderMap>),
+    // VIPER-PATCH(connect-head-fields): the head's order too.
+    (alpn, fields, order): (&[AlpnProtocol], Option<&HeaderMap>, Option<&OrigHeaderMap>),
     mut connector: HttpsConnector<S>,
     dst: &Uri,
 ) -> Result<Opened<MaybeHttpsStream<T>>, TunnelError>
@@ -101,6 +106,10 @@ where
     // VIPER-PATCH(request-connect-fields): the request's own fields.
     if let Some(fields) = fields {
         request.headers_mut().extend(fields.clone());
+    }
+    // VIPER-PATCH(connect-head-fields): in the request's order.
+    if let Some(order) = order {
+        order.call(request.headers_mut());
     }
     let response = sender
         .try_send_request(request)

@@ -841,9 +841,26 @@ impl RequestBuilder {
     /// not send them. Without it, nothing changes.
     pub fn connect_headers(mut self, headers: HeaderMap) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
-            req.config_mut::<RequestOptions>()
-                .get_or_insert_default()
-                .connect_fields = Some(ConnectFields(headers));
+            let options = req.config_mut::<RequestOptions>().get_or_insert_default();
+            let order = options.connect_fields.take().and_then(|fields| fields.1);
+            options.connect_fields = Some(ConnectFields(headers, order));
+        }
+        self
+    }
+
+    // VIPER-PATCH(connect-head-fields): a browser writes its `CONNECT`
+    // head's fields in its own order and case.
+    /// Writes the HTTP/1.1 `CONNECT` head of this request's tunnel with its
+    /// fields, `Host` included, in `order`'s order and case; the fields it
+    /// does not name follow, in lower case, and `Host` comes first when it
+    /// does not name it. On an HTTP/2 `CONNECT` stream the order applies,
+    /// names in lower case (RFC 9113 section 8.2.1). Part of the
+    /// connection's pool key, as [`connect_headers`](Self::connect_headers).
+    pub fn connect_order(mut self, order: OrigHeaderMap) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            let options = req.config_mut::<RequestOptions>().get_or_insert_default();
+            let fields = options.connect_fields.take().map(|fields| fields.0);
+            options.connect_fields = Some(ConnectFields(fields.unwrap_or_default(), Some(order)));
         }
         self
     }

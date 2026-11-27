@@ -15,6 +15,8 @@ use crate::{
     client::layer::config::ConnectFields, conn::net::SocketBindOptions, group::Group,
     proxy::Matcher, tls::TlsOptions,
 };
+// VIPER-PATCH(connect-head-fields): the `CONNECT` head's order.
+use crate::header::OrigHeaderMap;
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -150,6 +152,12 @@ impl ConnectionDescriptor {
     #[inline]
     pub(crate) fn connect_headers(&self) -> Option<&HeaderMap> {
         self.connect_fields.as_ref().map(|fields| &fields.0)
+    }
+
+    // VIPER-PATCH(connect-head-fields): the `CONNECT` head's order and case.
+    #[inline]
+    pub(crate) fn connect_order(&self) -> Option<&OrigHeaderMap> {
+        self.connect_fields.as_ref().and_then(|fields| fields.1.as_ref())
     }
 
     /// Return a reference to the [`SocketBindOptions`].

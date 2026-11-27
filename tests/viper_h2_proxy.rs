@@ -103,7 +103,12 @@ struct Proxy {
     offers: Arc<Mutex<Vec<Vec<u8>>>>,
     // VIPER-PATCH(request-connect-fields): what each `CONNECT` carried.
     connects: Connects,
+    // VIPER-PATCH(connect-head-fields): each `CONNECT`'s field names.
+    names: Names,
 }
+
+/// Each `CONNECT`'s field names, in order.
+type Names = Arc<Mutex<Vec<Vec<String>>>>;
 
 /// Each `CONNECT`'s `Proxy-Authorization` value, in order.
 type Connects = Arc<Mutex<Vec<Option<String>>>>;
@@ -116,22 +121,26 @@ async fn proxy(select: &'static [u8], refused: Option<(u16, Refusal)>) -> Proxy 
     let count = Arc::clone(&accepted);
     let connects = Connects::default();
     let seen = Arc::clone(&connects);
+    let names = Names::default();
+    let named = Arc::clone(&names);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             count.fetch_add(1, Ordering::SeqCst);
             let tls = accept_tls(&context, stream).await;
-            let seen = Arc::clone(&seen);
+            let (seen, named) = (Arc::clone(&seen), Arc::clone(&named));
             if tls.ssl().selected_alpn_protocol() == Some(b"h2".as_slice()) {
                 let serve = service_fn(move |request: Request<Incoming>| {
                     let field = request.headers().get("proxy-authorization");
                     let field = field.map(|value| value.to_str().unwrap().to_owned());
                     seen.lock().unwrap().push(field);
+                    let keys = request.headers().keys().map(|name| name.to_string());
+                    named.lock().unwrap().push(keys.collect());
                     connect(request, refused)
                 });
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
                 tokio::spawn(conn.serve_connection(TokioIo::new(tls), serve));
             } else {
-                tokio::spawn(connect_http1(tls, seen));
+                tokio::spawn(connect_http1(tls, seen, named));
             }
         }
     });
@@ -140,6 +149,7 @@ async fn proxy(select: &'static [u8], refused: Option<(u16, Refusal)>) -> Proxy 
         accepted,
         offers,
         connects,
+        names,
     }
 }
 
@@ -175,7 +185,7 @@ async fn connect(
 }
 
 /// One HTTP/1.1 `CONNECT`, answered 200 and relayed.
-async fn connect_http1(mut tls: SslStream<TcpStream>, seen: Connects) {
+async fn connect_http1(mut tls: SslStream<TcpStream>, seen: Connects, named: Names) {
     let mut head = Vec::new();
     while !head.ends_with(b"\r\n\r\n") {
         head.push(tls.read_u8().await.unwrap());
@@ -187,6 +197,8 @@ async fn connect_http1(mut tls: SslStream<TcpStream>, seen: Connects) {
             .then(|| value.to_owned())
     });
     seen.lock().unwrap().push(field);
+    let lines = head.lines().skip(1).filter_map(|line| line.split_once(": "));
+    named.lock().unwrap().push(lines.map(|(name, _)| name.to_owned()).collect());
     let target = head
         .strip_prefix("CONNECT ")
         .unwrap()
@@ -334,5 +346,50 @@ async fn a_requests_connect_fields_go_on_its_own_tunnel_only() {
         let given = Some("Basic YW5zd2VyOmdpdmVu".to_owned());
         // Two tunnels, each reused by the later request with its fields.
         assert_eq!(*proxy.connects.lock().unwrap(), [route, given]);
+    }
+}
+
+// VIPER-PATCH(connect-head-fields): a request's `CONNECT` order holds over
+// HTTP/2 (names in lower case, RFC 9113 section 8.2.1) and HTTP/1.1, and is
+// part of the tunnel's key. (A connection-specific field such as
+// `Proxy-Connection` never goes on an HTTP/2 stream: wreq-proto's client
+// strips it, RFC 9113 section 8.2.2.)
+#[tokio::test]
+async fn a_requests_connect_order_holds_and_keys_its_tunnel() {
+    let http2 = (H2_AND_HTTP1, BOTH, ["user-agent", "x-order"]);
+    let http1 = (HTTP1_ONLY, &[AlpnProtocol::HTTP1][..], ["User-Agent", "X-Order"]);
+    for (select, alpn, written) in [http2, http1] {
+        let origin = origin().await;
+        let proxy = proxy(select, None).await;
+        let config = wreq::Proxy::all(&proxy.url).unwrap().alpn_protocols(alpn);
+        let client = Client::builder()
+            .proxy(config)
+            .tls_cert_verification(false)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{origin}/");
+        let mut fields = http::HeaderMap::new();
+        fields.insert("x-order", http::HeaderValue::from_static("second"));
+        fields.insert("user-agent", http::HeaderValue::from_static("Agent/1"));
+        let mut order = wreq::header::OrigHeaderMap::new();
+        order.insert("User-Agent");
+        order.insert("X-Order");
+        for ordered in [true, false, true] {
+            let request = client.get(&url).connect_headers(fields.clone());
+            let request = if ordered {
+                request.connect_order(order.clone())
+            } else {
+                request
+            };
+            let body = request.send().await.unwrap().text().await.unwrap();
+            assert_eq!(body, origin.to_string());
+        }
+        // Two tunnels: the third request reuses the first's.
+        // Over HTTP/1.1 the tunnel writes `Host` first, the order not
+        // naming it.
+        let host: &[&str] = if select == HTTP1_ONLY { &["Host"] } else { &[] };
+        let lower = ["x-order", "user-agent"];
+        let expected = [[host, &written[..]].concat(), [host, &lower[..]].concat()];
+        assert_eq!(*proxy.names.lock().unwrap(), expected);
     }
 }

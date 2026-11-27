@@ -60,7 +60,8 @@ impl VersionFields {
 // key.
 /// Fields of the `CONNECT` request of a request's tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConnectFields(pub HeaderMap);
+// VIPER-PATCH(connect-head-fields): and the head's order and case.
+pub(crate) struct ConnectFields(pub HeaderMap, pub Option<OrigHeaderMap>);
 
 impl Hash for ConnectFields {
     /// By name, in sorted order, then each name's values in order, as
@@ -73,6 +74,10 @@ impl Hash for ConnectFields {
             for value in self.0.get_all(name) {
                 value.as_bytes().hash(state);
             }
+        }
+        // VIPER-PATCH(connect-head-fields): the head's order and case.
+        for (_, case) in self.1.iter().flat_map(OrigHeaderMap::iter) {
+            case.hash(state);
         }
     }
 }

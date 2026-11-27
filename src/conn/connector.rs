@@ -436,6 +436,9 @@ impl TransportConnector {
                         if let Some(fields) = fields.clone() {
                             tunnel = tunnel.with_headers(fields);
                         }
+                        // VIPER-PATCH(connect-head-fields): the head's order.
+                        let order = descriptor.connect_order().cloned();
+                        tunnel = tunnel.with_order(order.clone());
 
                         // VIPER-PATCH(h2-proxy-connect): a CONNECT stream, else
                         // HTTP/1.1 on the connection made with the list.
@@ -444,7 +447,8 @@ impl TransportConnector {
                             let opened = proxy::h2::open(
                                 shared,
                                 &proxy,
-                                (alpn, fields.as_ref()),
+                                // VIPER-PATCH(connect-head-fields): with the order.
+                                (alpn, fields.as_ref(), order.as_ref()),
                                 connector.clone(),
                                 &uri,
                             );

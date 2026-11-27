@@ -5,9 +5,17 @@ use std::{
 
 use bytes::BytesMut;
 // VIPER-PATCH(typed-proxy-errors): StatusCode for the kept status.
-use http::{HeaderMap, HeaderValue, StatusCode, Uri};
+// VIPER-PATCH(connect-head-fields): `Host` and the credentials as fields.
+use http::{
+    HeaderMap, HeaderValue, StatusCode, Uri,
+    header::{HOST, PROXY_AUTHORIZATION},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tower::{BoxError, Service};
+// VIPER-PATCH(connect-head-fields): the head's order and case.
+use wreq_proto::ext::OnPreserveHeaderCallback;
+
+use crate::header::OrigHeaderMap;
 
 // VIPER-PATCH(typed-proxy-errors): the public failure type.
 use super::{
@@ -24,6 +32,8 @@ use crate::ext::UriExt;
 #[derive(Debug)]
 pub struct TunnelConnector<C> {
     headers: Headers,
+    // VIPER-PATCH(connect-head-fields): the head's order and case.
+    order: Option<OrigHeaderMap>,
     inner: C,
     proxy_dst: Uri,
 }
@@ -86,6 +96,7 @@ impl<C> TunnelConnector<C> {
     pub fn new(proxy_dst: Uri, connector: C) -> Self {
         Self {
             headers: Headers::Empty,
+            order: None, // VIPER-PATCH(connect-head-fields)
             inner: connector,
             proxy_dst,
         }
@@ -132,6 +143,13 @@ impl<C> TunnelConnector<C> {
         self
     }
 
+    // VIPER-PATCH(connect-head-fields): the head's fields, `Host` among
+    // them, written in `order`'s order and case.
+    pub(crate) fn with_order(mut self, order: Option<OrigHeaderMap>) -> Self {
+        self.order = order;
+        self
+    }
+
     // VIPER-PATCH(h2-proxy-connect): an HTTP/1.1 `CONNECT` on a connection
     // to the proxy already made (one that did not select `h2`).
     pub(crate) async fn tunnel_over<T>(&self, conn: T, dst: &Uri) -> Result<T, TunnelError>
@@ -139,7 +157,9 @@ impl<C> TunnelConnector<C> {
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let host = dst.host().ok_or(TunnelError::MissingHost)?;
-        tunnel(conn, host, dst.port_or_default(), &self.headers).await
+        // VIPER-PATCH(connect-head-fields): with the order.
+        let head = (&self.headers, self.order.as_ref());
+        tunnel(conn, host, dst.port_or_default(), head).await
     }
 }
 
@@ -165,6 +185,7 @@ where
     fn call(&mut self, dst: Uri) -> Self::Future {
         let connecting = self.inner.call(self.proxy_dst.clone());
         let headers = self.headers.clone();
+        let order = self.order.clone(); // VIPER-PATCH(connect-head-fields)
 
         Tunneling {
             fut: Box::pin(async move {
@@ -176,7 +197,7 @@ where
                     conn,
                     dst.host().ok_or(TunnelError::MissingHost)?,
                     dst.port_or_default(),
-                    &headers,
+                    (&headers, order.as_ref()), // VIPER-PATCH(connect-head-fields)
                 )
                 .await
             }),
@@ -185,17 +206,24 @@ where
     }
 }
 
-async fn tunnel<T>(mut conn: T, host: &str, port: u16, headers: &Headers) -> Result<T, TunnelError>
+// VIPER-PATCH(connect-head-fields): the head's order with its fields.
+async fn tunnel<T>(
+    conn: T,
+    host: &str,
+    port: u16,
+    (headers, order): (&Headers, Option<&OrigHeaderMap>),
+) -> Result<T, TunnelError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = format!(
-        "\
-         CONNECT {host}:{port} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
-         "
-    )
-    .into_bytes();
+    let mut buf = format!("CONNECT {host}:{port} HTTP/1.1\r\n").into_bytes();
+    // VIPER-PATCH(connect-head-fields): `Host` and the fields in the
+    // order's order and case, `Host` first when the order does not name it.
+    if let Some(order) = order {
+        ordered(&mut buf, (host, port), headers, order)?;
+        return handshake(conn, buf).await;
+    }
+    buf.extend_from_slice(format!("Host: {host}:{port}\r\n").as_bytes());
 
     match headers {
         Headers::Auth(auth) => {
@@ -216,7 +244,48 @@ where
 
     // headers end
     buf.extend_from_slice(b"\r\n");
+    // VIPER-PATCH(connect-head-fields): the head written, its answer read.
+    handshake(conn, buf).await
+}
 
+// VIPER-PATCH(connect-head-fields): the head's fields, `Host` among them,
+// in `order`'s order and case, then the end of the head.
+fn ordered(
+    buf: &mut Vec<u8>,
+    (host, port): (&str, u16),
+    headers: &Headers,
+    order: &OrigHeaderMap,
+) -> Result<(), TunnelError> {
+    let mut fields = match headers {
+        Headers::Extra(extra) => extra.clone(),
+        Headers::Auth(auth) => HeaderMap::from_iter([(PROXY_AUTHORIZATION, auth.clone())]),
+        Headers::Empty => HeaderMap::new(),
+    };
+    let value =
+        HeaderValue::from_str(&format!("{host}:{port}")).map_err(|_| TunnelError::MissingHost)?;
+    fields.insert(HOST, value);
+    let named = order.iter().any(|(name, _)| *name == HOST);
+    if !named && let Some(value) = fields.remove(HOST) {
+        buf.extend_from_slice(b"Host: ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    order.call_visit(&mut fields, &mut |name, value| {
+        buf.extend_from_slice(name.as_ref());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    });
+    buf.extend_from_slice(b"\r\n");
+    Ok(())
+}
+
+// VIPER-PATCH(connect-head-fields): the head's write and its answer, as
+// before, apart from the head's fields.
+async fn handshake<T>(mut conn: T, buf: Vec<u8>) -> Result<T, TunnelError>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     conn.write_all(&buf).await.map_err(TunnelError::Io)?;
     conn.flush().await.map_err(TunnelError::Io)?;
 
