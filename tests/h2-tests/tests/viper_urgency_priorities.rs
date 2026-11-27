@@ -62,7 +62,8 @@ async fn each_request_depends_on_the_newest_open_stream_at_the_nearest_urgency()
         // Its own urgency first: stream 7, though stream 11 is newer.
         srv.recv_frame(get(13, Some((7, 146, true)))).await;
         for id in [11, 13, 1, 3, 7, 9] {
-            srv.send_frame(frames::headers(id).response(200).eos()).await;
+            srv.send_frame(frames::headers(id).response(200).eos())
+                .await;
         }
         idle_ms(10).await;
     };

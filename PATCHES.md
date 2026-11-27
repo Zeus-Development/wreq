@@ -102,7 +102,9 @@ of HEADERS frames and PRIORITY frames are unchanged.
 
 1. A new http2 release gets a new branch, `viper/http2-<version>`, from
    the commit its published crate names, with an equalizing commit if it
-   was published from a modified checkout; the base verification above is
+   was published from a modified checkout; where GitHub refuses that
+   commit's history, as for this branch, from a root commit holding its
+   exact tree (the same git tree hash). The base verification above is
    repeated.
 2. Each patch is applied again as its own commit, its markers kept, and
    dropped if upstream has an equivalent.
