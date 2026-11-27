@@ -79,6 +79,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `trust-anchors` | `TlsOptions::trust_anchor_ids` requests trust anchor IDs (draft-ietf-tls-trust-anchor-ids) in every hello, an origin's or a proxy's, through BoringSSL's `SSL_set1_requested_trust_anchors`; an empty or longer-than-255-byte ID fails the connector's build | none | fork: `tests/viper_hello_options.rs`; Viper: `viper-net::wreq_pin a_hello_requests_the_trust_anchor_ids_of_its_options` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `preconnect-connect-fields` | `Client::preconnect_with_connect_fields` opens connections ahead with the tunnel fields and order a request sets (`connect_headers`, `connect_order`), so a preconnected tunnel is keyed and written as that request's and the request takes it | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_preconnected_tunnel_with_connect_fields_serves_the_request` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `negotiated-alpn` | `Conn::negotiated_h2` tells a connector layer whether a connection it made negotiated HTTP/2 through ALPN (RFC 7301), so a layer racing connections to one origin can give up the others once one is shared | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_connector_layer_reads_whether_a_connection_negotiated_http2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `local-port-bind` | a caller may choose each TCP socket's source port (`ClientBuilder::tcp_source_port`): asked with the peer (a proxy's address for a connection through it) and the try number, the port is bound before connect, asked again on `EADDRINUSE` or `EACCES`, and left to the OS once the caller answers `None`; a connector layer reads a connection's local and peer addresses (`Conn::addresses`), so a browser that randomizes source ports per peer can do so and learn when each closes | none | fork: `tests/viper_source_port.rs`; Viper: `viper-net::source_port a_providers_ports_are_the_ones_the_server_sees` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -407,6 +408,27 @@ whether the transport under it negotiated `h2` through ALPN; false for
 HTTP/1.1, no ALPN or plain text. A layer racing several connections to one
 origin can give up the others as soon as one negotiated HTTP/2, which the
 pool shares.
+
+## local-port-bind
+
+wreq opens and binds every TCP socket itself (`src/conn/net/tcp.rs`):
+with a local address configured it binds that address with port 0, so the
+OS always picks the source port, and the TCP connector is not
+replaceable. A browser that picks its own source ports (Chrome's
+`EphemeralPortRandomizer` on macOS, a uniform port per publicly routable
+peer, with up to five tries) could not be followed. With the patch
+(`src/client.rs`, `src/conn/http.rs`, `src/conn/net.rs`,
+`src/conn/net/tcp.rs`),
+`ClientBuilder::tcp_source_port` takes a function asked for each socket
+with its peer and the try number, 0 first; its port is bound, on the
+configured local address of the peer's family or the unspecified one,
+before connect. A port in use or not allowed (`EADDRINUSE`, `EACCES`) asks
+again with the next try number; once the function answers `None` the
+socket is bound as before. A connection through a proxy asks with the
+proxy's address: the socket only ever reaches the proxy. `Conn::addresses`
+(`src/conn.rs`) gives a connector layer the local and peer addresses of
+the socket under a connection, so the caller can learn when a chosen port
+is released. Without the function nothing changes.
 
 ## Rebase procedure
 
