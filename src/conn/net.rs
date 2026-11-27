@@ -28,6 +28,11 @@ if_compio_rt! {
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+// VIPER-PATCH(local-port-bind): a caller's choice of each socket's source
+// port, asked with the peer and the try number (0 first).
+pub(crate) type SourcePort =
+    std::sync::Arc<dyn Fn(std::net::SocketAddr, u32) -> Option<u16> + Send + Sync>;
+
 /// Options for configuring socket bind behavior for outbound connections.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Default)]
 pub(crate) struct SocketBindOptions {

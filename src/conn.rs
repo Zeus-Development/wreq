@@ -110,6 +110,21 @@ impl Conn {
     }
 }
 
+// VIPER-PATCH(local-port-bind): a connector layer can read the local and
+// peer addresses of the socket under a connection, to tell whoever chose
+// its source port when it closes.
+impl Conn {
+    /// The local and peer addresses of the TCP socket under the
+    /// connection (the proxy's for a connection through a proxy), if the
+    /// transport gives them.
+    pub fn addresses(&self) -> Option<(std::net::SocketAddr, std::net::SocketAddr)> {
+        let mut extensions = Extensions::new();
+        self.stream.connected().set_extras(&mut extensions);
+        let info = extensions.get::<self::http::HttpInfo>()?;
+        Some((info.local_addr, info.remote_addr))
+    }
+}
+
 // VIPER-PATCH(negotiated-alpn): a connector layer that races several
 // connections to one origin can tell, once one is made, whether it
 // negotiated HTTP/2 (ALPN, RFC 7301), which a client shares, and so give up

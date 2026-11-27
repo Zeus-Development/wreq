@@ -205,6 +205,8 @@ struct Config {
     tcp_recv_buffer_size: Option<usize>,
     tcp_happy_eyeballs_timeout: Option<Duration>,
     socket_bind_options: SocketBindOptions,
+    // VIPER-PATCH(local-port-bind): the caller's source port choice.
+    tcp_source_port: Option<crate::conn::net::SourcePort>,
     proxies: Vec<ProxyMatcher>,
     auto_sys_proxy: bool,
     retry_policy: retry::Policy,
@@ -294,6 +296,8 @@ impl Client {
                 tcp_recv_buffer_size: None,
                 tcp_happy_eyeballs_timeout: Some(Duration::from_millis(300)),
                 socket_bind_options: SocketBindOptions::default(),
+                // VIPER-PATCH(local-port-bind): the OS's ports by default.
+                tcp_source_port: None,
                 proxies: Vec::new(),
                 auto_sys_proxy: true,
                 retry_policy: retry::Policy::default(),
@@ -659,6 +663,8 @@ impl ClientBuilder {
                         config.socket_bind_options.ipv4_address,
                         config.socket_bind_options.ipv6_address,
                     );
+                    // VIPER-PATCH(local-port-bind): every socket asks it.
+                    http.set_source_port(config.tcp_source_port);
                 })
                 .build(config.tls_options, config.connector_layers)?;
 
@@ -1384,6 +1390,22 @@ impl ClientBuilder {
         D: Into<Option<Duration>>,
     {
         self.config.tcp_happy_eyeballs_timeout = val.into();
+        self
+    }
+
+    // VIPER-PATCH(local-port-bind): a caller chooses each TCP socket's
+    // source port, as a browser that randomizes them does.
+    /// Chooses the source port of each TCP socket the client opens, bound
+    /// before it connects: `choose` gets the peer (the proxy's address for
+    /// a connection through a proxy) and the try number, 0 first, and
+    /// answers a port, or `None` to leave the port to the OS. A port in
+    /// use or not allowed (`EADDRINUSE`, `EACCES`) asks again with the next
+    /// try number, so `choose` must answer `None` after its last try.
+    pub fn tcp_source_port<F>(mut self, choose: F) -> ClientBuilder
+    where
+        F: Fn(SocketAddr, u32) -> Option<u16> + Send + Sync + 'static,
+    {
+        self.config.tcp_source_port = Some(Arc::new(choose));
         self
     }
 

@@ -488,6 +488,38 @@ fn bind_local_address(
     Ok(())
 }
 
+// VIPER-PATCH(local-port-bind): binds the port `choose` gives for `dst`, on
+// the configured local address of its family or the unspecified one. A
+// port in use or not allowed (`EADDRINUSE`, `EACCES`) asks again with the
+// next try number; once `choose` answers `None`, the OS picks the port.
+fn bind_source_port(
+    socket: &socket2::Socket,
+    dst: &SocketAddr,
+    bind: &SocketBindOptions,
+    choose: &super::SourcePort,
+) -> io::Result<()> {
+    let ip: std::net::IpAddr = match dst {
+        SocketAddr::V4(_) => bind.ipv4_address.unwrap_or(Ipv4Addr::UNSPECIFIED).into(),
+        SocketAddr::V6(_) => bind.ipv6_address.unwrap_or(Ipv6Addr::UNSPECIFIED).into(),
+    };
+    let mut attempt = 0;
+    while let Some(port) = choose(*dst, attempt) {
+        match socket.bind(&SocketAddr::new(ip, port).into()) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AddrInUse | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    bind_local_address(socket, dst, &bind.ipv4_address, &bind.ipv6_address)
+}
+
 fn connect<S: TcpConnector>(
     addr: &SocketAddr,
     config: &TcpOptions,
@@ -576,12 +608,17 @@ where
         warn!("tcp set_tcp_user_timeout error: {_e}");
     }
 
-    bind_local_address(
-        &socket,
-        addr,
-        &config.socket_bind.ipv4_address,
-        &config.socket_bind.ipv6_address,
-    )
+    // VIPER-PATCH(local-port-bind): a chosen source port is bound before
+    // connect, in place of the OS's.
+    match &config.source_port {
+        Some(choose) => bind_source_port(&socket, addr, &config.socket_bind, choose),
+        None => bind_local_address(
+            &socket,
+            addr,
+            &config.socket_bind.ipv4_address,
+            &config.socket_bind.ipv6_address,
+        ),
+    }
     .map_err(ConnectError::m("tcp bind local error"))?;
 
     if config.reuse_address
@@ -711,6 +748,8 @@ pub(crate) struct TcpOptions {
     pub tcp_user_timeout: Option<Duration>,
     pub tcp_keepalive: TcpKeepaliveOptions,
     pub socket_bind: SocketBindOptions,
+    // VIPER-PATCH(local-port-bind): the caller's source port choice, if any.
+    pub source_port: Option<super::SourcePort>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -951,6 +990,7 @@ mod tests {
             tcp_user_timeout: None,
             tcp_keepalive: TcpKeepaliveOptions::default(),
             socket_bind: SocketBindOptions::default(),
+            source_port: None,
         }
     }
 

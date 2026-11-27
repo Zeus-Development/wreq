@@ -166,6 +166,7 @@ impl<R, S> HttpConnector<R, S> {
                 tcp_user_timeout: None,
                 tcp_keepalive: TcpKeepaliveOptions::default(),
                 socket_bind: SocketBindOptions::default(),
+                source_port: None,
             }),
             resolver,
             connector,
@@ -177,6 +178,11 @@ impl<R, S> HttpConnector<R, S> {
         // config. So mutating the config won't ever affect previous
         // clones.
         Arc::make_mut(&mut self.options)
+    }
+
+    // VIPER-PATCH(local-port-bind): the caller's source port choice.
+    pub(crate) fn set_source_port(&mut self, choose: Option<super::net::SourcePort>) {
+        self.config_mut().source_port = choose;
     }
 }
 
