@@ -79,7 +79,8 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `trust-anchors` | `TlsOptions::trust_anchor_ids` requests trust anchor IDs (draft-ietf-tls-trust-anchor-ids) in every hello, an origin's or a proxy's, through BoringSSL's `SSL_set1_requested_trust_anchors`; an empty or longer-than-255-byte ID fails the connector's build | none | fork: `tests/viper_hello_options.rs`; Viper: `viper-net::wreq_pin a_hello_requests_the_trust_anchor_ids_of_its_options` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `preconnect-connect-fields` | `Client::preconnect_with_connect_fields` opens connections ahead with the tunnel fields and order a request sets (`connect_headers`, `connect_order`), so a preconnected tunnel is keyed and written as that request's and the request takes it | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_preconnected_tunnel_with_connect_fields_serves_the_request` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `negotiated-alpn` | `Conn::negotiated_h2` tells a connector layer whether a connection it made negotiated HTTP/2 through ALPN (RFC 7301), so a layer racing connections to one origin can give up the others once one is shared | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_connector_layer_reads_whether_a_connection_negotiated_http2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
-| `local-port-bind` | a caller may choose each TCP socket's source port (`ClientBuilder::tcp_source_port`): asked with the peer (a proxy's address for a connection through it) and the try number, the port is bound before connect, asked again on `EADDRINUSE` or `EACCES`, and left to the OS once the caller answers `None`; a connector layer reads a connection's local and peer addresses (`Conn::addresses`), so a browser that randomizes source ports per peer can do so and learn when each closes | none | fork: `tests/viper_source_port.rs`; Viper: `viper-net::source_port a_providers_ports_are_the_ones_the_server_sees` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `local-port-bind` | a caller may choose each TCP socket's source port (`ClientBuilder::tcp_source_port`): asked with the peer (a proxy's address for a connection through it) and the try number, the port is bound before connect, asked again on `EADDRINUSE` or `EACCES`, and left to the OS once the caller answers `None`; a connector layer reads a connection's local and peer addresses (`Conn::addresses`), so a browser that randomizes source ports per peer can do so and learn when each closes | none | fork: `tests/viper_source_port.rs`; Viper: `viper-net::wreq_pin a_source_port_function_binds_each_socket_before_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `ws-tunnel` | a request may force its connection through an HTTP or HTTPS proxy to be a `CONNECT` tunnel for an `http` URL too (`RequestBuilder::force_tunnel`), with no TLS inside the tunnel, the request in origin form and without the proxy's credentials, keyed apart in the pool, so a WebSocket client tunnels a `ws:` handshake as RFC 6455 section 4.1 recommends | `adr:net-websocket-http-proxy` | fork: `tests/viper_ws_tunnel.rs`; Viper: `viper-net::websocket a_ws_handshake_through_an_http_proxy_goes_through_a_tunnel` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -430,6 +431,27 @@ proxy's address: the socket only ever reaches the proxy. `Conn::addresses`
 the socket under a connection, so the caller can learn when a chosen port
 is released. Without the function nothing changes.
 
+## ws-tunnel
+
+wreq tunnels through an HTTP or HTTPS proxy only for an `https`
+destination (`src/conn/connector.rs`); an `http` one is forwarded in
+absolute form with the proxy's credentials on the request. RFC 6455
+section 4.1 asks a WebSocket client to tunnel a `ws:` handshake with
+`CONNECT` through an HTTP proxy, as browsers do, since a proxy may not
+forward an `Upgrade`. With the patch, `RequestBuilder::force_tunnel(true)`
+(`src/client/request.rs`) sets a flag in the request's `ConnectFields`
+(`src/client/layer/config.rs`), which keeps it next to the tunnel's fields
+and order (each setter keeps the others) and compares and hashes it, so a
+forced tunnel's connection is keyed apart from a forwarded one's in the
+pool. The descriptor (`src/conn/descriptor.rs`) reads it, and the
+connector takes its tunnel branch when the destination is `https` or the
+flag is set; for an `http` destination the HTTPS connector adds no TLS
+inside the tunnel, and the connection, like every tunnel, is not marked
+proxied, so the request goes in origin form with no `Proxy-Authorization`.
+A preconnect sets no flag (`src/client.rs`). An `https` URL, a SOCKS proxy,
+a Unix socket and no proxy are unchanged, and so is everything without the
+call.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -462,3 +484,4 @@ is released. Without the function nothing changes.
 | CDP-FETCH-TUNNEL-AUTH-1 | the last commit of this range | the patches `connect-challenge-fields` and `request-connect-fields` |
 | NET-CONNECT-FIELDS-1 | the last commit of this range | the patch `connect-head-fields` |
 | WREQ-H2-PRIORITY-1 | the last commit of this range | the patches `proxy-hello-options`, `trust-anchors`, `preconnect-connect-fields` and `negotiated-alpn` |
+| WREQ-FORK-3 | the last commit of this range | the patches `local-port-bind` and `ws-tunnel` |
