@@ -72,7 +72,7 @@ for byte. The upstream commit stays the source of record. Verified on
 
 | Id | Reason | Register entry | Tests | Licence and upstream attribution | Upstream status |
 | --- | --- | --- | --- | --- | --- |
-| `h2-stream-priority` | each request's HEADERS frame carries its own RFC 9113 section 5.3.2 priority, chosen by the request's RFC 9218 urgency: a weight per urgency, an exclusive flag and a parent rule, in place of the one priority a connection gave every request | `adr:net-h2-priority-order` | fork: `tests/h2-tests/tests/viper_urgency_priorities.rs`; Viper: `viper-net::transport_wire urgency_priorities_set_each_headers_priority_and_parent` | MIT (Viper's own change) | candidate; never offered without the owner's approval |
+| `h2-stream-priority` | each request's HEADERS frame carries its own RFC 9113 section 5.3.2 priority, chosen by the request's RFC 9218 urgency: a weight per urgency, an exclusive flag and a parent rule, in place of the one priority a connection gave every request | `adr:net-h2-priority-order` | fork: `tests/h2-tests/tests/viper_urgency_priorities.rs`; Viper: `viper-net::h2_priority urgency_priorities_set_each_headers_priority_and_parent` | MIT (Viper's own change) | candidate; never offered without the owner's approval |
 
 ## h2-stream-priority
 
