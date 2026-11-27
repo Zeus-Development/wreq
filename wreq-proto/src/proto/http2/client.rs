@@ -1,4 +1,6 @@
 use std::{
+    // VIPER-PATCH(h2-priority-order): the requests held in urgency order.
+    collections::VecDeque,
     convert::Infallible,
     future::Future,
     marker::PhantomData,
@@ -19,6 +21,8 @@ use futures_util::{
 use http::{Method, Request, Response, StatusCode};
 use http2::{
     client::{Builder, Connection, ResponseFuture, SendRequest},
+    // VIPER-PATCH(h2-priority-order): a request's RFC 9218 urgency.
+    ext::Urgency,
     SendStream,
 };
 use http_body::Body;
@@ -44,6 +48,10 @@ use crate::{
 
 /// Receiver for HTTP/2 client requests
 type ClientRx<B> = dispatch::Receiver<Request<B>, Response<Incoming>>;
+
+// VIPER-PATCH(h2-priority-order): a request taken from the channel, with
+// its callback, and its urgency.
+type Held<B> = (Urgency, (Request<B>, Callback<Request<B>, Response<Incoming>>));
 
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
@@ -105,6 +113,8 @@ where
         executor: exec,
         h2_tx,
         req_rx,
+        // VIPER-PATCH(h2-priority-order): the requests held in urgency order.
+        held: VecDeque::new(),
         fut_ctx: None,
         marker: PhantomData,
     })
@@ -332,8 +342,47 @@ where
     executor: E,
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
+    // VIPER-PATCH(h2-priority-order): the requests held in urgency order.
+    held: VecDeque<Held<B>>,
     fut_ctx: Option<FutCtx<B>>,
     marker: PhantomData<T>,
+}
+
+// VIPER-PATCH(h2-priority-order): http2 gives a stream its id when the
+// request is sent, and a client opens its streams in ascending id order
+// (RFC 9113 section 5.1.1), so the order in which requests open streams is
+// the order of the dispatch's sends. Each poll takes every request the
+// channel holds and keeps it after those of the same or a lower urgency
+// value (RFC 9218 section 4.1; the default urgency, 3, for one with none),
+// so the most urgent is sent first, in the order sent within an urgency.
+// While a stream waits to open (at the server's concurrent stream limit),
+// the requests after it wait in the channel and are ordered when it opens.
+fn poll_held<B: Body>(
+    req_rx: &mut ClientRx<B>,
+    held: &mut VecDeque<Held<B>>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<(Request<B>, Callback<Request<B>, Response<Incoming>>)>> {
+    let mut closed = false;
+    loop {
+        match req_rx.poll_recv(cx) {
+            Poll::Ready(Some(request)) => {
+                let urgency = request.0.extensions().get::<Urgency>().copied();
+                let urgency = urgency.unwrap_or_default();
+                let at = held.partition_point(|(other, _)| *other <= urgency);
+                held.insert(at, (urgency, request));
+            }
+            Poll::Ready(None) => {
+                closed = true;
+                break;
+            }
+            Poll::Pending => break,
+        }
+    }
+    match held.pop_front() {
+        Some((_, request)) => Poll::Ready(Some(request)),
+        None if closed => Poll::Ready(None),
+        None => Poll::Pending,
+    }
 }
 
 pin_project! {
@@ -621,7 +670,9 @@ where
                 continue;
             }
 
-            match self.req_rx.poll_recv(cx) {
+            // VIPER-PATCH(h2-priority-order): the most urgent request held.
+            let this = &mut *self;
+            match poll_held(&mut this.req_rx, &mut this.held, cx) {
                 Poll::Ready(Some((req, cb))) => {
                     // Check that future hasn't been canceled already
                     if cb.is_canceled() {

@@ -293,6 +293,10 @@ where
         if let Some(priority) = self.opts.priorities {
             builder.priorities(priority);
         }
+        // VIPER-PATCH(h2-priority-order): each request's HEADERS priority.
+        if let Some(priorities) = self.opts.urgency_priorities {
+            builder.urgency_priorities(priorities);
+        }
 
         // Create the ping configuration for the connection.
         let ping_config = ping::Config::new(

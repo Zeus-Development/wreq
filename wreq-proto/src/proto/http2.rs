@@ -20,6 +20,9 @@ pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
     SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
 };
+// VIPER-PATCH(h2-priority-order): a request's RFC 9218 urgency, and the
+// HEADERS priority each request's urgency chooses.
+pub use http2::ext::{Urgency, UrgencyParent, UrgencyPriorities};
 use http2::{Reason, RecvStream, SendStream};
 use http_body::Body;
 use pin_project_lite::pin_project;
@@ -539,6 +542,12 @@ pub struct Http2Options {
 
     /// The list of PRIORITY frames to be sent after connection establishment.
     pub priorities: Option<Priorities>,
+
+    // VIPER-PATCH(h2-priority-order): each request's HEADERS priority by its
+    // urgency (http2's `h2-stream-priority`).
+    /// The HEADERS priority each request's [`Urgency`] chooses, in place of
+    /// `headers_stream_dependency`.
+    pub urgency_priorities: Option<UrgencyPriorities>,
 }
 
 impl Http2OptionsBuilder {
@@ -798,6 +807,22 @@ impl Http2OptionsBuilder {
         self
     }
 
+    // VIPER-PATCH(h2-priority-order): each request's HEADERS priority by
+    // its RFC 9218 urgency (RFC 9113 section 5.3.2).
+    /// Sets the HEADERS priority each request's [`Urgency`] (in its
+    /// extensions; the default one without) chooses, in place of
+    /// [`headers_stream_dependency`](Self::headers_stream_dependency).
+    #[inline]
+    pub fn urgency_priorities<T>(mut self, priorities: T) -> Self
+    where
+        T: Into<Option<UrgencyPriorities>>,
+    {
+        if let Some(priorities) = priorities.into() {
+            self.opts.urgency_priorities = Some(priorities);
+        }
+        self
+    }
+
     /// Sets the HTTP/2 pseudo-header field order for outgoing HEADERS frames.
     ///
     /// This determines the order in which pseudo-header fields (such as `:method`, `:scheme`, etc.)
@@ -898,6 +923,8 @@ impl Default for Http2Options {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            // VIPER-PATCH(h2-priority-order): none by default.
+            urgency_priorities: None,
         }
     }
 }

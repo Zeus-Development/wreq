@@ -24,3 +24,10 @@ incremental = false
 [profile.bench]
 codegen-units = 1
 incremental = false
+
+# VIPER-PATCH(h2-priority-order): the HTTP/2 client reads a request's
+# urgency, a type of Viper's http2 fork (branch viper/http2-0.5.20), which
+# this workspace builds in place of the published http2 0.5.20. A Viper
+# build takes http2 from its own [patch.crates-io] entry, at the same rev.
+[patch.crates-io]
+http2 = { git = "https://github.com/Zeus-Development/wreq", rev = "0c3bf28339d29af83d39438fab69652079ce08d0" }
