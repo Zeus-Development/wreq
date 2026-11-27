@@ -75,6 +75,10 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `connect-challenge-fields` | an HTTP proxy's 407 answer to `CONNECT`, over HTTP/1.1 or as an HTTP/2 stream, keeps its fields on the failure (`ProxyFailure::headers`), its `Proxy-Authenticate` challenges among them, so a caller can answer them (RFC 9110 sections 15.5.8 and 11.7.1) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_connect_challenge.rs`, `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_tunnels_407_pauses_and_its_answer_goes_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `request-connect-fields` | a request may set the fields of the `CONNECT` that opens its own tunnel (`RequestBuilder::connect_headers`), in place of the proxy's of their names, its tunnel keyed apart in the pool, so a caller answers a proxy's challenge on that request's tunnel only (RFC 9110 sections 9.3.6 and 11.7.2) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_routes_refused_credentials_give_way_to_the_answer_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connect-head-fields` | a request may set the order and case of the fields of its tunnel's `CONNECT` head (`RequestBuilder::connect_order`), `Host` among them, part of its tunnel's key, so a client writes that head as a browser does; over HTTP/2 the order holds and names stay lower case (RFC 9113 section 8.2.1) | none | fork: `tests/viper_connect_head.rs`, `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_connect a_policys_connect_plan_is_written_in_its_order_and_case` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `proxy-hello-options` | the hello to an HTTPS proxy carries the per-connection options of an origin's (SNI and hostname settings, ECH GREASE, the AES override, ALPS with its code point, the key shares and, with `trust-anchors`, the trust anchor IDs), so a client's proxy hello is the one its origin hellos are; the proxy's ALPN and the origin's session stay apart | none | fork: `tests/viper_hello_options.rs`; Viper: `viper-net::proxy_https a_proxys_hello_carries_the_profiles_per_connection_options` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `trust-anchors` | `TlsOptions::trust_anchor_ids` requests trust anchor IDs (draft-ietf-tls-trust-anchor-ids) in every hello, an origin's or a proxy's, through BoringSSL's `SSL_set1_requested_trust_anchors`; an empty or longer-than-255-byte ID fails the connector's build | none | fork: `tests/viper_hello_options.rs`; Viper: `viper-net::wreq_pin a_hello_requests_the_trust_anchor_ids_of_its_options` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `preconnect-connect-fields` | `Client::preconnect_with_connect_fields` opens connections ahead with the tunnel fields and order a request sets (`connect_headers`, `connect_order`), so a preconnected tunnel is keyed and written as that request's and the request takes it | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_preconnected_tunnel_with_connect_fields_serves_the_request` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `negotiated-alpn` | `Conn::negotiated_h2` tells a connector layer whether a connection it made negotiated HTTP/2 through ALPN (RFC 7301), so a layer racing connections to one origin can give up the others once one is shared | none | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::wreq_pin a_connector_layer_reads_whether_a_connection_negotiated_http2` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -355,6 +359,55 @@ HTTP/2 `CONNECT` stream (`src/conn/proxy/h2.rs`) sorts its fields by the
 same order, names in lower case (RFC 9113 section 8.2.1). Without the call
 nothing changes, byte for byte.
 
+## proxy-hello-options
+
+`TlsConnector::setup_ssl` (`src/tls/conn.rs`), which makes the SSL object
+of the TLS connection to an HTTPS proxy, set only the proxy's ALPN list, so
+that hello carried none of the per-connection options `setup_ssl2` sets on
+an origin's: SNI and hostname verification as configured, ECH GREASE, the
+random AES override, ALPS with its code point and the key shares. A client
+copying a browser's hello thus sent a different one to its proxy. With the
+patch both call `hello_options`, which sets them all (and, with
+`trust-anchors`, the trust anchor IDs); the proxy keeps its own ALPN list,
+and the origin's version-dependent ALPN and session resumption stay the
+origin's. BoringSSL sends ALPS only with ALPN, so a proxy offered no ALPN
+gets none.
+
+## trust-anchors
+
+`TlsOptions::trust_anchor_ids` (`src/tls.rs`), with its builder method,
+holds the trust anchor IDs a client requests (draft-ietf-tls-trust-anchor-ids
+section 4.1): each an opaque, non-empty ID of at most 255 bytes. The
+connector's build (`src/tls/conn.rs`) encodes them once in the wire format
+BoringSSL takes (each ID with an 8-bit length), refusing an invalid one as a
+builder error, and `hello_options` sets them on every SSL object, an
+origin's or a proxy's, through btls-sys's `SSL_set1_requested_trust_anchors`
+at the version wreq links (one `unsafe` call; the library copies the bytes).
+An empty list sends the extension empty; `None`, the default, sends none.
+
+## preconnect-connect-fields
+
+`Client::preconnect` (`src/client.rs`, the patches `pool-preconnect` and
+`grouped-preconnect`) keyed its connections with no tunnel fields, so
+through an HTTP proxy a preconnected tunnel had neither the `CONNECT`
+fields nor the order a request sets (`request-connect-fields`,
+`connect-head-fields`) and a request with them never took it.
+`Client::preconnect_with_connect_fields(uri, count, group, headers, order)`
+gives the layer's `preconnect` (`src/client/layer/client.rs`) the same
+`ConnectFields` a request with `connect_headers(headers)` and, with an
+order, `connect_order(order)` gets, so the connection is keyed and its
+`CONNECT` written as that request's. `preconnect` is unchanged.
+
+## negotiated-alpn
+
+A connector layer (`ClientBuilder::connector_layer`) gets each connection
+as a `Conn` and could not see the protocol it negotiated: `Connection` and
+`Connected` are not exported. `Conn::negotiated_h2` (`src/conn.rs`) tells
+whether the transport under it negotiated `h2` through ALPN; false for
+HTTP/1.1, no ALPN or plain text. A layer racing several connections to one
+origin can give up the others as soon as one negotiated HTTP/2, which the
+pool shares.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -386,3 +439,4 @@ nothing changes, byte for byte.
 | NET-WREQ-FORK-2 | the last commit of this range | the patches `version-fields`, `grouped-preconnect` and `connector-layer-identity` |
 | CDP-FETCH-TUNNEL-AUTH-1 | the last commit of this range | the patches `connect-challenge-fields` and `request-connect-fields` |
 | NET-CONNECT-FIELDS-1 | the last commit of this range | the patch `connect-head-fields` |
+| WREQ-H2-PRIORITY-1 | the last commit of this range | the patches `proxy-hello-options`, `trust-anchors`, `preconnect-connect-fields` and `negotiated-alpn` |
