@@ -59,7 +59,9 @@ async fn each_request_depends_on_the_newest_open_stream_at_the_nearest_urgency()
         srv.send_frame(frames::headers(5).response(200).eos()).await;
         // Stream 5 is closed, so stream 3 is the newest open at urgency 1.
         srv.recv_frame(get(11, Some((3, 219, true)))).await;
-        for id in [11, 1, 3, 7, 9] {
+        // Its own urgency first: stream 7, though stream 11 is newer.
+        srv.recv_frame(get(13, Some((7, 146, true)))).await;
+        for id in [11, 13, 1, 3, 7, 9] {
             srv.send_frame(frames::headers(id).response(200).eos()).await;
         }
         idle_ms(10).await;
@@ -79,7 +81,9 @@ async fn each_request_depends_on_the_newest_open_stream_at_the_nearest_urgency()
         let third = held.remove(2);
         h2.drive(third).await.unwrap();
         let (last, _) = client.send_request(request(Some(1)), true).unwrap();
+        let (own, _) = client.send_request(request(Some(3)), true).unwrap();
         h2.drive(last).await.unwrap();
+        h2.drive(own).await.unwrap();
         for response in held {
             h2.drive(response).await.unwrap();
         }
