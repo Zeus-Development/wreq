@@ -30,4 +30,4 @@ incremental = false
 # this workspace builds in place of the published http2 0.5.20. A Viper
 # build takes http2 from its own [patch.crates-io] entry, at the same rev.
 [patch.crates-io]
-http2 = { git = "https://github.com/Zeus-Development/wreq", rev = "2766272f2619bd3433273a22558827a6eb431a24" }
+http2 = { git = "https://github.com/Zeus-Development/wreq", rev = "7db8001baf8683d592ba6eb8a118180cc7914113" }

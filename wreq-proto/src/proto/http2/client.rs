@@ -51,7 +51,24 @@ type ClientRx<B> = dispatch::Receiver<Request<B>, Response<Incoming>>;
 
 // VIPER-PATCH(h2-priority-order): a request taken from the channel, with
 // its callback, and its urgency.
-type Held<B> = (Urgency, (Request<B>, Callback<Request<B>, Response<Incoming>>));
+type Queued<B> = (Request<B>, Callback<Request<B>, Response<Incoming>>);
+type Held<B> = (Urgency, Queued<B>);
+
+// VIPER-PATCH(h2-priority-order): a request held but not sent comes back
+// with its message when the dispatch ends, as one left in the channel does
+// (the channel's envelope), so the client may send it again elsewhere.
+struct HeldQueue<B>(VecDeque<Held<B>>);
+
+impl<B> Drop for HeldQueue<B> {
+    fn drop(&mut self) {
+        for (_, (request, cb)) in self.0.drain(..) {
+            cb.send(Err(TrySendError {
+                error: Error::new_canceled().with("connection closed"),
+                message: Some(request),
+            }));
+        }
+    }
+}
 
 ///// An mpsc channel is used to help notify the `Connection` task when *all*
 ///// other handles to it have been dropped, so that it can shutdown.
@@ -114,7 +131,7 @@ where
         h2_tx,
         req_rx,
         // VIPER-PATCH(h2-priority-order): the requests held in urgency order.
-        held: VecDeque::new(),
+        held: HeldQueue(VecDeque::new()),
         fut_ctx: None,
         marker: PhantomData,
     })
@@ -343,7 +360,7 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     // VIPER-PATCH(h2-priority-order): the requests held in urgency order.
-    held: VecDeque<Held<B>>,
+    held: HeldQueue<B>,
     fut_ctx: Option<FutCtx<B>>,
     marker: PhantomData<T>,
 }
@@ -356,12 +373,13 @@ where
 // value (RFC 9218 section 4.1; the default urgency, 3, for one with none),
 // so the most urgent is sent first, in the order sent within an urgency.
 // While a stream waits to open (at the server's concurrent stream limit),
-// the requests after it wait in the channel and are ordered when it opens.
+// the requests sent after it wait, held or in the channel, and are ordered
+// with the held ones when it opens.
 fn poll_held<B: Body>(
     req_rx: &mut ClientRx<B>,
     held: &mut VecDeque<Held<B>>,
     cx: &mut Context<'_>,
-) -> Poll<Option<(Request<B>, Callback<Request<B>, Response<Incoming>>)>> {
+) -> Poll<Option<Queued<B>>> {
     let mut closed = false;
     loop {
         match req_rx.poll_recv(cx) {
@@ -672,7 +690,7 @@ where
 
             // VIPER-PATCH(h2-priority-order): the most urgent request held.
             let this = &mut *self;
-            match poll_held(&mut this.req_rx, &mut this.held, cx) {
+            match poll_held(&mut this.req_rx, &mut this.held.0, cx) {
                 Poll::Ready(Some((req, cb))) => {
                     // Check that future hasn't been canceled already
                     if cb.is_canceled() {

@@ -97,16 +97,62 @@ async fn h2_requests_waiting_at_the_stream_limit_open_most_urgent_first() {
     assert_eq!(first.expect("a response").status(), StatusCode::OK);
     let held = client.try_send_request(get("/held", Some(7)));
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let waiting: Vec<_> = [("/low", Some(5)), ("/mid", Some(3)), ("/high", Some(0))]
+    let mut waiting: Vec<_> = [("/low", Some(5)), ("/mid", Some(3)), ("/high", Some(0))]
         .iter()
         .map(|(path, urgency)| client.try_send_request(get(path, *urgency)))
         .collect();
+    // `/high` now waits to open, `/mid` and `/low` are held; `/top`, sent
+    // later, is ordered with the held ones when `/high` opens.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    waiting.push(client.try_send_request(get("/top", Some(1))));
     assert_eq!(held.await.expect("a response").status(), StatusCode::OK);
     for response in waiting {
         assert_eq!(response.await.expect("a response").status(), StatusCode::OK);
     }
     let paths = paths.lock().expect("unpoisoned").clone();
-    assert_eq!(paths, ["/first", "/held", "/high", "/mid", "/low"]);
+    assert_eq!(paths, ["/first", "/held", "/high", "/top", "/mid", "/low"]);
+}
+
+/// A server of one stream at a time that answers `/first`, then accepts
+/// one more stream, waits 150 ms for another and closes the connection.
+async fn close_after_one(io: DuplexStream) {
+    let mut builder = ::http2::server::Builder::new();
+    builder.max_concurrent_streams(1);
+    let mut conn = builder.handshake::<_, Bytes>(io).await.expect("server handshake");
+    let (_first, mut respond) = conn.accept().await.expect("a request").expect("its head");
+    let ok = Response::builder().status(StatusCode::OK).body(()).expect("a 200");
+    respond.send_response(ok, true).expect("200 sent");
+    let _held = conn.accept().await.expect("a request").expect("its head");
+    let _ = tokio::time::timeout(Duration::from_millis(150), conn.accept()).await;
+}
+
+#[tokio::test]
+async fn h2_held_requests_come_back_when_the_connection_ends() {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(close_after_one(server_io));
+    let (mut client, conn) = http2::Builder::new(TokioExecutor::new())
+        .handshake::<_, Empty<Bytes>>(client_io)
+        .await
+        .expect("client handshake");
+    tokio::spawn(conn);
+    let first = client.try_send_request(get("/first", None)).await;
+    assert_eq!(first.expect("a response").status(), StatusCode::OK);
+    let held = client.try_send_request(get("/held", None));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    // `/a` waits to open with its stream id; `/b` and `/c` are held.
+    let waiting: Vec<_> = ["/a", "/b", "/c"]
+        .iter()
+        .map(|path| client.try_send_request(get(path, None)))
+        .collect();
+    let _ = held.await;
+    let mut returned = Vec::new();
+    for response in waiting {
+        if let Err(mut error) = response.await {
+            returned.extend(error.take_message().map(|request| request.uri().path().to_owned()));
+        }
+    }
+    // As a request left in the channel, so the client may resend it.
+    assert_eq!(returned, ["/b", "/c"]);
 }
 
 #[tokio::test]

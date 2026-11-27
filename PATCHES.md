@@ -144,9 +144,12 @@ held ones of the same or a lower urgency value (http2's `ext::Urgency`
 from the request's extensions, RFC 9218's default 3 without), and sends
 the most urgent first, in the order sent within one urgency. At the
 server's concurrent stream limit the request sent last waits to open with
-its id, and those after it wait in the channel, so they are ordered when
-it opens; a more urgent request that comes after that one still follows
-it. A connection whose requests carry no urgency sends them as before.
+its id, and those after it wait, held or in the channel, and are ordered
+with the held ones when it opens; a more urgent request that comes after
+that one still follows it. When the dispatch ends, a held request comes
+back with its message, as one left in the channel does, so the client may
+send it again on another connection. A connection whose requests carry no
+urgency sends them as before.
 `Http2Options::urgency_priorities` (and its builder method) hands http2's
 `client::Builder::urgency_priorities` its value, and `wreq_proto::http2`
 re-exports `Urgency`, `UrgencyParent` and `UrgencyPriorities`. The
