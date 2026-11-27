@@ -19,6 +19,8 @@ use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::Protocol,
+    // VIPER-PATCH(h2-stream-priority): the request priority types.
+    ext::{Urgency, UrgencyParent, UrgencyPriorities},
     frame::{self, Frame, Reason},
     proto,
     proto::{peer, Error, Initiator, Open, Peer, WindowSize},
@@ -97,6 +99,11 @@ struct Inner {
 
     /// Priority of the headers stream
     priorities: Option<Priorities>,
+
+    // VIPER-PATCH(h2-stream-priority): each request's own priority, and the
+    // streams it opened with their urgency, oldest first, for its parent.
+    urgency_priorities: Option<UrgencyPriorities>,
+    opened: Vec<(StreamId, Urgency)>,
 }
 
 #[derive(Debug)]
@@ -246,6 +253,8 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        // VIPER-PATCH(h2-stream-priority): the request's RFC 9218 urgency.
+        let urgency = request.extensions_mut().remove::<Urgency>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -305,6 +314,12 @@ where
             }
         }
 
+        // VIPER-PATCH(h2-stream-priority): the request's own priority, if
+        // the connection signals one per request.
+        let dependency = me
+            .urgency_dependency(stream_id, urgency.unwrap_or_default())
+            .or(me.headers_stream_dependency);
+
         // Convert the message
         let headers = client::Peer::convert_send_message(
             stream_id,
@@ -312,7 +327,7 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            me.headers_stream_dependency,
+            dependency, // VIPER-PATCH(h2-stream-priority): the request's own.
         )?;
 
         let mut stream = me.store.insert(stream.id, stream);
@@ -443,6 +458,29 @@ impl<B> DynStreams<'_, B> {
 }
 
 impl Inner {
+    // VIPER-PATCH(h2-stream-priority): RFC 9113 section 5.3.1's dependency
+    // and section 5.3.2's weight of a new stream `id` of `urgency`, under
+    // the connection's `UrgencyPriorities`; a stream no longer stored or
+    // closed is no parent.
+    fn urgency_dependency(&mut self, id: StreamId, urgency: Urgency) -> Option<StreamDependency> {
+        let priorities = self.urgency_priorities?;
+        let parent = match priorities.parent {
+            UrgencyParent::Root => StreamId::ZERO,
+            UrgencyParent::NearestOpen => {
+                let store = &mut self.store;
+                self.opened.retain(|(open, _)| {
+                    store.find_mut(open).map_or(false, |s| !s.state.is_closed())
+                });
+                let above = self.opened.iter().filter(|(_, at)| *at <= urgency);
+                let parent = above.max_by_key(|(_, at)| *at).map(|(open, _)| *open);
+                self.opened.push((id, urgency));
+                parent.unwrap_or(StreamId::ZERO)
+            }
+        };
+        let weight = priorities.weights[usize::from(urgency.value())];
+        Some(StreamDependency::new(parent, weight, priorities.exclusive))
+    }
+
     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
             counts: Counts::new(peer, &config),
@@ -457,6 +495,9 @@ impl Inner {
             headers_stream_dependency: config.headers_stream_dependency,
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
+            // VIPER-PATCH(h2-stream-priority): each request's own priority.
+            urgency_priorities: config.urgency_priorities,
+            opened: Vec::new(),
         }))
     }
 

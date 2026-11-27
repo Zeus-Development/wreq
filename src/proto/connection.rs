@@ -87,6 +87,8 @@ pub(crate) struct Config {
     pub headers_pseudo_order: Option<PseudoOrder>,
     pub headers_stream_dependency: Option<StreamDependency>,
     pub priorities: Option<Priorities>,
+    // VIPER-PATCH(h2-stream-priority): each request's own priority.
+    pub urgency_priorities: Option<crate::ext::UrgencyPriorities>,
 }
 
 #[derive(Debug)]
@@ -130,6 +132,8 @@ where
                 headers_stream_dependency: config.headers_stream_dependency,
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
                 priorities: config.priorities.clone(),
+                // VIPER-PATCH(h2-stream-priority): each request's own priority.
+                urgency_priorities: config.urgency_priorities,
             }
         }
         let streams = Streams::new(streams_config(&config));

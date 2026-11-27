@@ -137,6 +137,8 @@
 
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
+// VIPER-PATCH(h2-stream-priority): the request priority types.
+use crate::ext::UrgencyPriorities;
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
 use crate::frame::{
@@ -358,6 +360,9 @@ pub struct Builder {
 
     /// Priority stream list
     priorities: Option<Priorities>,
+
+    // VIPER-PATCH(h2-stream-priority): each request's own priority.
+    urgency_priorities: Option<UrgencyPriorities>,
 }
 
 #[derive(Debug)]
@@ -681,6 +686,8 @@ impl Builder {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            // VIPER-PATCH(h2-stream-priority): each request's own priority.
+            urgency_priorities: None,
         }
     }
 
@@ -1234,6 +1241,18 @@ impl Builder {
         self
     }
 
+    // VIPER-PATCH(h2-stream-priority): a priority per request, by the
+    // request's RFC 9218 urgency, as RFC 9113 section 5.3.2 lets a client
+    // signal one in each HEADERS frame.
+    /// Sets each request's HEADERS priority by its
+    /// [`Urgency`](crate::ext::Urgency) (the default
+    /// one when its extensions have none), in place of
+    /// [`headers_stream_dependency`](Self::headers_stream_dependency).
+    pub fn urgency_priorities(&mut self, priorities: UrgencyPriorities) -> &mut Self {
+        self.urgency_priorities = Some(priorities);
+        self
+    }
+
     /// Sets the list of PRIORITY frames to be sent immediately after the connection is established,
     /// but before the first request is sent.
     ///
@@ -1434,6 +1453,8 @@ where
                 headers_pseudo_order: builder.headers_pseudo_order,
                 headers_stream_dependency: builder.headers_stream_dependency,
                 priorities: builder.priorities,
+                // VIPER-PATCH(h2-stream-priority): each request's own priority.
+                urgency_priorities: builder.urgency_priorities,
                 settings: builder.settings,
             },
         );

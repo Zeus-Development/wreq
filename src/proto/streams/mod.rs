@@ -82,6 +82,9 @@ pub struct Config {
 
     /// Priorities stream
     pub priorities: Option<Priorities>,
+
+    // VIPER-PATCH(h2-stream-priority): each request's own priority.
+    pub urgency_priorities: Option<crate::ext::UrgencyPriorities>,
 }
 
 trait DebugStructExt<'a, 'b> {

@@ -1529,6 +1529,8 @@ where
                             headers_stream_dependency: None,
                             headers_pseudo_order: None,
                             priorities: None,
+                            // VIPER-PATCH(h2-stream-priority): each request's own priority.
+                            urgency_priorities: None,
                         },
                     );
 
