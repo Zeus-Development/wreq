@@ -255,7 +255,11 @@ async fn keep(
 
 // VIPER-PATCH(connect-407-retry): a `CONNECT`'s authority, `host:port`.
 fn authority(dst: &Uri) -> String {
-    format!("{}:{}", dst.host().unwrap_or_default(), dst.port_or_default())
+    format!(
+        "{}:{}",
+        dst.host().unwrap_or_default(),
+        dst.port_or_default()
+    )
 }
 
 // ===== impl TransportConnector =====

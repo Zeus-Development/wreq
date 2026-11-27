@@ -62,7 +62,11 @@ impl ProxyConnection {
     /// retry took it.
     pub(crate) fn new(stream: ProxyStream, proxy: &Intercept, authority: String) -> Self {
         let stream = Mutex::new(Some(stream));
-        let kept = Arc::new(Kept { proxy: proxy.clone(), authority, stream });
+        let kept = Arc::new(Kept {
+            proxy: proxy.clone(),
+            authority,
+            stream,
+        });
         let expiring = Arc::downgrade(&kept);
         Executor::default().execute(async move {
             Timer::default().sleep(KEPT_FOR).await;

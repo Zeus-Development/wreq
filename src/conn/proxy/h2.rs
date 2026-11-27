@@ -18,10 +18,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::{BoxError, Service};
 use wreq_proto::{
     conn::http2::{Builder, SendRequest},
-    // VIPER-PATCH(h2-proxy-profile): the client's options.
-    http2::Http2Options,
     // VIPER-PATCH(connect-head-fields): sorts the `CONNECT` stream's fields.
     ext::OnPreserveHeaderCallback,
+    // VIPER-PATCH(h2-proxy-profile): the client's options.
+    http2::Http2Options,
     rt::Executor as _,
     upgrade::{self, Upgraded},
 };
@@ -193,10 +193,7 @@ where
     if let Some(options) = options {
         builder = builder.options(options);
     }
-    let (mut sender, conn) = builder
-        .handshake(io)
-        .await
-        .map_err(failed)?;
+    let (mut sender, conn) = builder.handshake(io).await.map_err(failed)?;
     exec.execute(async move {
         drop(conn.await);
     });

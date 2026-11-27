@@ -58,7 +58,7 @@ async fn serve(mut stream: TcpStream, number: usize, (challenge, proxy): (&str, 
         let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
         stream.write_all(answer).await.unwrap();
     }
-    drop(proxy.1.send(number));
+    let _ = proxy.1.send(number);
 }
 
 type Record = (
@@ -111,7 +111,9 @@ async fn challenged(client: &Client, host: &str) -> Option<ProxyConnection> {
 async fn retry(client: &Client, host: &str, kept: ProxyConnection) -> String {
     let url = format!("http://{host}/");
     let request = client.get(url).force_tunnel(true);
-    let request = request.connect_headers(credentials()).proxy_connection(kept);
+    let request = request
+        .connect_headers(credentials())
+        .proxy_connection(kept);
     request.send().await.unwrap().text().await.unwrap()
 }
 
