@@ -340,8 +340,10 @@ in its map's order, so a client could not write the head a browser writes
 (Chrome: `Host`, `Proxy-Connection`, `User-Agent`). With the patch,
 `RequestBuilder::connect_order(order)` (`src/client/request.rs`) keeps an
 `OrigHeaderMap` with the request's `ConnectFields`
-(`src/client/layer/config.rs`), whose hash takes each spelling in order
-too, so a tunnel opened with one order serves only requests with the same.
+(`src/client/layer/config.rs`), whose hash and equality take each
+spelling in order too (`OrigHeaderMap`'s own equality ignores the order of
+its names), so a tunnel opened with one order serves only requests with the
+same order.
 The connector (`src/conn/connector.rs`) gives it, through the descriptor
 (`src/conn/descriptor.rs`), to the HTTP/1.1 tunnel
 (`src/conn/proxy/tunnel.rs`), which writes `Host` and the head's fields

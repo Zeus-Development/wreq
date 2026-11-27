@@ -59,9 +59,27 @@ impl VersionFields {
 // opens one request's tunnel through an HTTP proxy, part of its connection's
 // key.
 /// Fields of the `CONNECT` request of a request's tunnel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)] // VIPER-PATCH(connect-head-fields): equality below
 // VIPER-PATCH(connect-head-fields): and the head's order and case.
 pub(crate) struct ConnectFields(pub HeaderMap, pub Option<OrigHeaderMap>);
+
+// VIPER-PATCH(connect-head-fields): `OrigHeaderMap`'s own equality ignores
+// the order of its names, which is the head's order here: two orders are
+// the same only name by name, in order and spelling, as `Hash` takes them.
+impl PartialEq for ConnectFields {
+    fn eq(&self, other: &Self) -> bool {
+        let same = match (&self.1, &other.1) {
+            (Some(mine), Some(theirs)) => {
+                let theirs = theirs.iter().map(|(_, case)| case);
+                mine.iter().map(|(_, case)| case).eq(theirs)
+            }
+            (mine, theirs) => mine.is_none() && theirs.is_none(),
+        };
+        self.0 == other.0 && same
+    }
+}
+
+impl Eq for ConnectFields {}
 
 impl Hash for ConnectFields {
     /// By name, in sorted order, then each name's values in order, as

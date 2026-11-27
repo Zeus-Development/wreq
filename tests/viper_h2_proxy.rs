@@ -374,22 +374,30 @@ async fn a_requests_connect_order_holds_and_keys_its_tunnel() {
         let mut order = wreq::header::OrigHeaderMap::new();
         order.insert("User-Agent");
         order.insert("X-Order");
-        for ordered in [true, false, true] {
+        let mut reversed = wreq::header::OrigHeaderMap::new();
+        reversed.insert("X-Order");
+        reversed.insert("User-Agent");
+        for given in [Some(&order), None, Some(&order), Some(&reversed)] {
             let request = client.get(&url).connect_headers(fields.clone());
-            let request = if ordered {
-                request.connect_order(order.clone())
-            } else {
-                request
+            let request = match given {
+                Some(order) => request.connect_order(order.clone()),
+                None => request,
             };
             let body = request.send().await.unwrap().text().await.unwrap();
             assert_eq!(body, origin.to_string());
         }
-        // Two tunnels: the third request reuses the first's.
+        // Three tunnels: the third request reuses the first's, and the
+        // same names in another order open their own.
         // Over HTTP/1.1 the tunnel writes `Host` first, the order not
         // naming it.
         let host: &[&str] = if select == HTTP1_ONLY { &["Host"] } else { &[] };
         let lower = ["x-order", "user-agent"];
-        let expected = [[host, &written[..]].concat(), [host, &lower[..]].concat()];
+        let reversed = [written[1], written[0]];
+        let expected = [
+            [host, &written[..]].concat(),
+            [host, &lower[..]].concat(),
+            [host, &reversed[..]].concat(),
+        ];
         assert_eq!(*proxy.names.lock().unwrap(), expected);
     }
 }
