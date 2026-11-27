@@ -74,6 +74,7 @@ other package, keeps its own version and is not built from this fork.
 | `header-count-growth` | a response head with more fields than the parser's default slots is parsed again with more slots; only the head's size bounds it (RFC 9110 and RFC 9112 set no field-count limit) | `adr:net-header-fidelity` (its field-count part) | fork: `src/proto/http1/role.rs` `viper_patch_tests`; Viper: `viper-net::fetch a_heads_size_bounds_it_and_not_its_field_count` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `content-length-values` | differing `Content-Length` values get their own parse error, told apart from an unreadable value (RFC 9112 section 6.3) | `adr:net-content-length-parse` | fork: `src/proto/http1/role.rs` `viper_content_length_tests`; Viper: `viper-net::fetch differing_content_length_values_are_told_from_an_unreadable_one` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `response-bytes` | an HTTP/1 request whose connection fails before the response head is complete (an end of stream, a failed read or a failed write) learns whether any response byte had arrived, an informational response or part of the head, so a client can tell an unanswered request from a partly answered one when it decides on an automatic retry (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_response_bytes.rs`; Viper: `viper-net::resend basic_resends_only_before_any_response_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `h2-informational` | the HTTP/2 client hands each interim (1xx) response, `103 Early Hints` among them, to the request's `on_informational` callback in the order received and before the final response, as the HTTP/1 client does (RFC 9110 section 15.2, RFC 9113 section 8.1) | `adr:net-early-hints` | fork: `tests/viper_h2_informational.rs`; Viper: `viper-net::early_hints http2_early_hints_reach_the_response_in_order` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## header-count-growth
 
@@ -118,6 +119,18 @@ false for every HTTP/2 error; for an error after the head (a body's) it has
 no meaning. Nothing else changes: the error's kind, cause and message stay
 as they were.
 
+## h2-informational
+
+The HTTP/2 client (`src/proto/http2/client.rs`) never asked http2 for a
+stream's interim responses: http2 0.5.20 keeps them on the stream for
+`ResponseFuture::poll_informational`, and its `poll_response` skips them, so
+a `103 Early Hints` over HTTP/2 reached no caller while the HTTP/1 client
+called the request's `on_informational` callback. With the patch the
+dispatch takes the callback from the request, as the HTTP/1 client does,
+and the response future hands it each interim response before it polls for
+the final one, in the order received. A request without a callback gets
+its final response as before.
+
 ## Rebase procedure
 
 1. A new wreq-proto release gets a new branch, `viper/wreq-proto-<version>`,
@@ -142,3 +155,4 @@ as they were.
 | --- | --- | --- |
 | V16d-3a | `ebb0c589afdb82f559df4000e6e26052f7daeb7f` | the branch, the base and the patches `header-count-growth` and `content-length-values` |
 | NET-RESEND-2 | the last commit of this range | the patch `response-bytes` |
+| WREQ-H2-PRIORITY-1 | the last commit of this range | the patch `h2-informational` |
