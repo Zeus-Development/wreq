@@ -4,7 +4,8 @@
 
 use std::{error::Error as StdError, fmt};
 
-use http::StatusCode;
+// VIPER-PATCH(connect-challenge-fields): the type of a 407's fields.
+use http::{HeaderMap, StatusCode};
 
 use crate::error::BoxError;
 
@@ -20,6 +21,8 @@ use crate::error::BoxError;
 pub struct ProxyFailure {
     kind: ProxyFailureKind,
     source: BoxError,
+    // VIPER-PATCH(connect-challenge-fields): a 407's fields.
+    fields: Option<Box<HeaderMap>>,
 }
 
 /// What failed in a connection through a proxy.
@@ -59,12 +62,29 @@ impl ProxyFailure {
         Self {
             kind,
             source: source.into(),
+            fields: None,
         }
+    }
+
+    // VIPER-PATCH(connect-challenge-fields): keeps a 407's fields.
+    pub(crate) fn with_fields(mut self, fields: Option<Box<HeaderMap>>) -> Self {
+        self.fields = fields;
+        self
     }
 
     /// What failed.
     pub fn kind(&self) -> ProxyFailureKind {
         self.kind
+    }
+
+    /// The fields of the HTTP proxy's 407 answer to `CONNECT` (RFC 9110
+    /// section 15.5.8), over HTTP/1.1 or as an HTTP/2 stream, its
+    /// `Proxy-Authenticate` challenges among them (section 11.7.1), so that
+    /// a caller can answer them; `None` for every other failure. A field
+    /// that is not valid is left out.
+    // VIPER-PATCH(connect-challenge-fields): the 407's fields.
+    pub fn headers(&self) -> Option<&HeaderMap> {
+        self.fields.as_deref()
     }
 }
 

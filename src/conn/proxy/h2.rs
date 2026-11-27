@@ -101,7 +101,11 @@ where
         .map_err(|error| failed(error.into_error()))?;
     match response.status() {
         StatusCode::OK => {}
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED => return Err(TunnelError::ProxyAuthRequired),
+        // VIPER-PATCH(connect-challenge-fields): with the 407's fields.
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
+            let fields = Box::new(response.headers().clone());
+            return Err(TunnelError::ProxyAuthRequired(fields));
+        }
         status => return Err(TunnelError::TunnelUnsuccessful(Some(status))),
     }
     let upgraded = upgrade::on(response).await.map_err(failed)?;

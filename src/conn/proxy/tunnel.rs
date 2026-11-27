@@ -41,7 +41,8 @@ pub enum TunnelError {
     Io(std::io::Error),
     Parse(httparse::Error),
     MissingHost,
-    ProxyAuthRequired,
+    // VIPER-PATCH(connect-challenge-fields): the 407's fields are kept.
+    ProxyAuthRequired(Box<HeaderMap>),
     TunnelUnexpectedEof,
     // VIPER-PATCH(typed-proxy-errors): the status is kept.
     TunnelUnsuccessful(Option<StatusCode>),
@@ -49,12 +50,18 @@ pub enum TunnelError {
 
 // VIPER-PATCH(typed-proxy-errors): each tunnel error's kind.
 impl From<TunnelError> for ProxyFailure {
-    fn from(error: TunnelError) -> Self {
+    fn from(mut error: TunnelError) -> Self {
+        // VIPER-PATCH(connect-challenge-fields): the 407's fields move to
+        // the failure.
+        let fields = match &mut error {
+            TunnelError::ProxyAuthRequired(fields) => Some(std::mem::take(fields)),
+            _ => None,
+        };
         let kind = match error {
             TunnelError::ConnectFailed(_) => ProxyFailureKind::Connect,
             TunnelError::Io(_) => ProxyFailureKind::Handshake,
             TunnelError::Parse(_) => ProxyFailureKind::Malformed,
-            TunnelError::ProxyAuthRequired => {
+            TunnelError::ProxyAuthRequired(_) => {
                 ProxyFailureKind::Status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
             }
             TunnelError::TunnelUnexpectedEof => ProxyFailureKind::Closed,
@@ -63,7 +70,7 @@ impl From<TunnelError> for ProxyFailure {
                 ProxyFailureKind::Other
             }
         };
-        ProxyFailure::new(kind, error)
+        ProxyFailure::new(kind, error).with_fields(fields)
     }
 }
 
@@ -226,7 +233,10 @@ where
             httparse::Status::Partial => continue,
             httparse::Status::Complete(_) => match res.code {
                 Some(200) => return Ok(conn),
-                Some(407) => return Err(TunnelError::ProxyAuthRequired),
+                // VIPER-PATCH(connect-challenge-fields): with its fields,
+                // its `Proxy-Authenticate` challenges among them (RFC 9110
+                // section 11.7.1).
+                Some(407) => return Err(TunnelError::ProxyAuthRequired(fields(res.headers))),
                 // VIPER-PATCH(typed-proxy-errors): the status is kept.
                 code => {
                     let status = code.and_then(|code| StatusCode::from_u16(code).ok());
@@ -237,13 +247,27 @@ where
     }
 }
 
+// VIPER-PATCH(connect-challenge-fields): a head's parsed fields; one that is
+// not a valid field is left out.
+fn fields(parsed: &[httparse::Header<'_>]) -> Box<HeaderMap> {
+    let field = |header: &httparse::Header<'_>| {
+        let name = http::HeaderName::from_bytes(header.name.as_bytes()).ok()?;
+        Some((name, HeaderValue::from_bytes(header.value).ok()?))
+    };
+    let mut fields = HeaderMap::new();
+    for (name, value) in parsed.iter().filter_map(field) {
+        fields.append(name, value);
+    }
+    Box::new(fields)
+}
+
 impl std::fmt::Display for TunnelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("tunnel error: ")?;
 
         f.write_str(match self {
             TunnelError::MissingHost => "missing destination host",
-            TunnelError::ProxyAuthRequired => "proxy authorization required",
+            TunnelError::ProxyAuthRequired(_) => "proxy authorization required",
             TunnelError::Parse(_) => "invalid proxy response",
             TunnelError::TunnelUnexpectedEof => "unexpected end of file",
             // VIPER-PATCH(typed-proxy-errors): the message is unchanged.

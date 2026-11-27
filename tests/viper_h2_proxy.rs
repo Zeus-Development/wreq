@@ -141,6 +141,11 @@ async fn connect(
         Some((at, Refusal::Status(status))) if at == port => {
             let mut response = Response::new(Empty::new());
             *response.status_mut() = status;
+            // VIPER-PATCH(connect-challenge-fields): a 407's challenge.
+            let challenge = hyper::header::HeaderValue::from_static("Basic realm=\"h2\"");
+            response
+                .headers_mut()
+                .insert("proxy-authenticate", challenge);
             Ok(response)
         }
         _ => {
@@ -190,10 +195,20 @@ async fn get(client: &Client, port: u16) -> Result<String, wreq::Error> {
 }
 
 fn failure(error: &wreq::Error) -> ProxyFailureKind {
+    proxy_failure(error).kind()
+}
+
+fn proxy_failure(error: &wreq::Error) -> &ProxyFailure {
     let top: &(dyn std::error::Error + 'static) = error;
     let mut chain = std::iter::successors(Some(top), |&e| e.source());
     let found = chain.find_map(|e| e.downcast_ref::<ProxyFailure>());
-    found.expect("a ProxyFailure in the chain").kind()
+    found.expect("a ProxyFailure in the chain")
+}
+
+/// VIPER-PATCH(connect-challenge-fields): the challenge a 407 kept.
+fn challenge(error: &wreq::Error) -> Option<&str> {
+    let fields = proxy_failure(error).headers()?;
+    fields.get("proxy-authenticate")?.to_str().ok()
 }
 
 const BOTH: &[AlpnProtocol] = &[AlpnProtocol::HTTP2, AlpnProtocol::HTTP1];
@@ -229,6 +244,9 @@ async fn a_reset_stream_or_a_status_fails_that_tunnel_only() {
         let error = get(&client, refused).await.unwrap_err();
         assert!(error.is_proxy_connect(), "{error:?}");
         assert_eq!(failure(&error), kind);
+        let is_407 = kind == ProxyFailureKind::Status(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        let kept = is_407.then_some("Basic realm=\"h2\"");
+        assert_eq!(challenge(&error), kept);
         assert_eq!(get(&client, last).await.unwrap(), last.to_string());
         assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1);
     }
