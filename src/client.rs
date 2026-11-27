@@ -70,6 +70,7 @@ use crate::{
     },
     dns::{DnsResolverWithOverrides, DynResolver, GaiResolver, IntoResolve, Resolve},
     error::{self, Error},
+    group::Group,
     header::OrigHeaderMap,
     http1::Http1Options,
     http2::Http2Options,
@@ -446,16 +447,24 @@ impl Client {
     /// once the connection is ready for a request, or the error a request
     /// would have got connecting (`uri` not absolute, the connection, the
     /// proxy or the TLS handshake failing).
+    ///
+    /// With a `group`, the connections are pooled in that group, so only a
+    /// request of the same group ([`crate::RequestBuilder::group`]) takes
+    /// them; without one they are pooled as above.
+    // VIPER-PATCH(grouped-preconnect): a client that partitions its
+    // connections by request group (wreq's `Group`) opens them ahead in a
+    // group's partition.
     pub fn preconnect(
         &self,
         uri: Uri,
         count: usize,
+        group: Option<Group>,
     ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
         let connections = (0..count).map(|_| {
-            let (client, uri) = (self.1.clone(), uri.clone());
+            let (client, uri, group) = (self.1.clone(), uri.clone(), group.clone());
             async move {
                 client
-                    .preconnect(uri.clone())
+                    .preconnect(uri.clone(), group)
                     .await
                     .map_err(|err| Error::request(err).with_uri(uri))
             }

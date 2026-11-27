@@ -47,6 +47,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
+    group::Group,
     rt::{Executor, Timer},
 };
 
@@ -216,18 +217,23 @@ where
     // for a later request to that origin to check out as any idle one. Over
     // HTTP/2 the pool keeps one connection per destination: while one is
     // being made, a second preconnect waits for it and shares it.
-    pub(crate) async fn preconnect(&self, uri: Uri) -> Result<(), Error> {
+    pub(crate) async fn preconnect(&self, uri: Uri, in_group: Option<Group>) -> Result<(), Error> {
         let mut req = Request::new(());
         *req.uri_mut() = uri;
         let uri = normalize_uri(&mut req, false)?;
         let RequestOptions {
-            group,
+            mut group,
             proxy,
             version,
             tls_options,
             socket_bind_options,
             ..
         } = RequestOptions::default();
+        // VIPER-PATCH(grouped-preconnect): keyed in `in_group` as a request
+        // of that group is (`RequestBuilder::group`).
+        if let Some(own) = in_group {
+            group.request(own);
+        }
         let descriptor =
             ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options);
         let mut this = self.clone();

@@ -1,4 +1,5 @@
-//! VIPER-PATCH(pool-preconnect): fork tests. A loopback HTTP/1.1 server
+//! VIPER-PATCH(pool-preconnect): fork tests, and those of
+//! VIPER-PATCH(grouped-preconnect). A loopback HTTP/1.1 server
 //! answers every request with the index of the connection it came on (from
 //! 0, in accept order), its body a moment after its head, and counts the connections it accepted; connections
 //! opened ahead of the requests serve them, within the pool's limits and
@@ -18,7 +19,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use wreq::{Client, Proxy};
+use wreq::{Client, Group, Proxy};
 
 /// A server's base URL and the count of connections it accepted.
 async fn server() -> (String, Arc<AtomicUsize>) {
@@ -74,7 +75,7 @@ async fn connections(client: &Client, url: &str, count: usize) -> Vec<String> {
 async fn preconnected_connections_serve_later_requests() {
     let (url, accepted) = server().await;
     let client = Client::builder().no_proxy().build().unwrap();
-    let outcomes = client.preconnect(url.parse().unwrap(), 2).await;
+    let outcomes = client.preconnect(url.parse().unwrap(), 2, None).await;
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     assert_eq!(accepted.load(Ordering::SeqCst), 2);
     assert_eq!(connections(&client, &url, 2).await, ["0", "1"]);
@@ -92,7 +93,7 @@ async fn the_pools_idle_limit_holds() {
         .pool_max_idle_per_host(1)
         .build()
         .unwrap();
-    let outcomes = client.preconnect(url.parse().unwrap(), 2).await;
+    let outcomes = client.preconnect(url.parse().unwrap(), 2, None).await;
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     let served = connections(&client, &url, 2).await;
     assert_eq!(accepted.load(Ordering::SeqCst), 3);
@@ -109,7 +110,7 @@ async fn a_preconnect_goes_through_the_proxy_chosen_for_the_uri() {
         .build()
         .unwrap();
     let origin = "http://origin.invalid/";
-    let outcomes = client.preconnect(origin.parse().unwrap(), 1).await;
+    let outcomes = client.preconnect(origin.parse().unwrap(), 1, None).await;
     assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
     assert_eq!(connections(&client, origin, 1).await, ["0"]);
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
@@ -123,13 +124,33 @@ async fn each_connection_reports_its_failure() {
     let closed = format!("http://{}/", listener.local_addr().unwrap());
     drop(listener);
     let client = Client::builder().no_proxy().build().unwrap();
-    let outcomes = client.preconnect(closed.parse().unwrap(), 2).await;
+    let outcomes = client.preconnect(closed.parse().unwrap(), 2, None).await;
     assert_eq!(outcomes.len(), 2);
     for outcome in outcomes {
         let error = outcome.unwrap_err();
         assert!(error.is_connect(), "{error:?}");
         assert_eq!(error.uri().map(Uri::to_string), Some(closed.clone()));
     }
-    let relative = client.preconnect(Uri::from_static("/path"), 1).await;
+    let relative = client.preconnect(Uri::from_static("/path"), 1, None).await;
     assert!(relative[0].is_err(), "{relative:?}");
+}
+
+// VIPER-PATCH(grouped-preconnect)
+/// A connection opened ahead in a group serves only a request of that
+/// group: another group's request, and one of no group, each make their
+/// own.
+#[tokio::test]
+async fn a_grouped_connection_serves_only_its_group() {
+    let (url, accepted) = server().await;
+    let client = Client::builder().no_proxy().build().unwrap();
+    let group = || Some(Group::new("a"));
+    let outcomes = client.preconnect(url.parse().unwrap(), 1, group()).await;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    let other = client.get(&url).group(Group::new("b")).send().await;
+    assert_eq!(other.unwrap().text().await.unwrap(), "1");
+    let none = client.get(&url).send().await.unwrap();
+    assert_eq!(none.text().await.unwrap(), "2");
+    let own = client.get(&url).group(Group::new("a")).send().await;
+    assert_eq!(own.unwrap().text().await.unwrap(), "0");
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
 }
