@@ -738,3 +738,157 @@ async fn a_superseded_attempt_with_nothing_won_starts_again() {
     assert_eq!(keys.len(), 2, "{keys:?}");
     assert_eq!(keys[0], keys[1]);
 }
+
+// VIPER-PATCH(h2-proxy-profile): a proxy that records the client's frames up
+// to its first HEADERS (type, flags, stream, payload), then closes.
+type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
+
+async fn recording_proxy() -> (String, tokio::sync::oneshot::Receiver<Frames>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    let (sender, frames) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tls = accept_tls(&context(H2_AND_HTTP1, Arc::default()), stream).await;
+        let mut preface = [0; 24];
+        tls.read_exact(&mut preface).await.unwrap();
+        let mut seen = Frames::new();
+        while seen.last().is_none_or(|frame| frame.0 != 1) {
+            let mut head = [0; 9];
+            tls.read_exact(&mut head).await.unwrap();
+            let length = u32::from_be_bytes([0, head[0], head[1], head[2]]);
+            let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+            let mut payload = vec![0; length as usize];
+            tls.read_exact(&mut payload).await.unwrap();
+            seen.push((head[3], head[4], stream, payload));
+        }
+        drop(sender.send(seen));
+    });
+    (url, frames)
+}
+
+// VIPER-PATCH(h2-proxy-profile): a SETTINGS payload's (id, value) pairs.
+fn settings(payload: &[u8]) -> Vec<(u16, u32)> {
+    let pair = |chunk: &[u8]| {
+        let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+        (id, u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]))
+    };
+    payload.chunks(6).map(pair).collect()
+}
+
+/// VIPER-PATCH(h2-proxy-profile): the connection to a proxy that selects
+/// `h2` opens with the client's HTTP/2 options, as a browser's does with its
+/// origin profile: SETTINGS in their order, the connection window and the
+/// HEADERS priority.
+#[tokio::test]
+async fn an_http2_proxy_connection_opens_with_the_clients_options() {
+    use wreq::http2::{Http2Options, SettingId, SettingsOrder, StreamDependency, StreamId};
+    let (url, frames) = recording_proxy().await;
+    let order = [
+        SettingId::HeaderTableSize,
+        SettingId::EnablePush,
+        SettingId::InitialWindowSize,
+        SettingId::MaxHeaderListSize,
+    ];
+    let options = Http2Options::builder()
+        .header_table_size(65_536)
+        .enable_push(false)
+        .initial_window_size(6_291_456)
+        .max_header_list_size(262_144)
+        .initial_connection_window_size(15_728_640)
+        .settings_order(SettingsOrder::builder().extend(order).build())
+        .headers_stream_dependency(StreamDependency::new(StreamId::from(0), 146, true))
+        .build();
+    let config = wreq::Proxy::all(&url).unwrap().alpn_protocols(BOTH);
+    let client = Client::builder()
+        .proxy(config)
+        .http2_options(options)
+        .tls_cert_verification(false)
+        .build()
+        .unwrap();
+    let sending = tokio::spawn(async move { get(&client, 9).await });
+    let frames = frames.await.unwrap();
+    sending.abort();
+    let (kind, _, stream, payload) = &frames[0];
+    assert_eq!((*kind, *stream), (4, 0), "SETTINGS first");
+    let expected = [(1, 65_536), (2, 0), (4, 6_291_456), (6, 262_144)];
+    assert_eq!(settings(payload), expected);
+    let update = frames.iter().find(|frame| frame.0 == 8).expect("WINDOW_UPDATE");
+    assert_eq!(update.2, 0);
+    assert_eq!(update.3, 15_663_105_u32.to_be_bytes());
+    let headers = frames.last().unwrap();
+    assert_eq!(headers.1 & 0x20, 0x20, "with a priority");
+    assert_eq!(headers.3[..5], [0x80, 0, 0, 0, 146], "exclusive on 0, weight 147");
+}
+
+// VIPER-PATCH(h2-proxy-addresses): what a connector layer reads of each
+// connection made: its addresses and whether it negotiated HTTP/2.
+type Read = Arc<Mutex<Vec<(Option<(std::net::SocketAddr, std::net::SocketAddr)>, bool)>>>;
+
+#[derive(Clone, Default)]
+struct Reading(Read);
+
+impl<S> tower::Layer<S> for Reading {
+    type Service = ReadingService<S>;
+    fn layer(&self, inner: S) -> ReadingService<S> {
+        ReadingService(inner, self.0.clone())
+    }
+}
+
+#[derive(Clone)]
+struct ReadingService<S>(S, Read);
+
+impl<S> tower::Service<wreq::Unnameable> for ReadingService<S>
+where
+    S: tower::Service<wreq::Unnameable, Response = wreq::Conn, Error = tower::BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = wreq::Conn;
+    type Error = tower::BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<wreq::Conn, tower::BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tower::BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: wreq::Unnameable) -> Self::Future {
+        let read = self.1.clone();
+        let connecting = self.0.call(target);
+        Box::pin(async move {
+            let conn = connecting.await?;
+            read.lock().unwrap().push((conn.addresses(), conn.negotiated_h2()));
+            Ok(conn)
+        })
+    }
+}
+
+/// VIPER-PATCH(h2-proxy-addresses): each tunnel over the shared HTTP/2
+/// connection gives that connection's socket addresses, as an HTTP/1.1
+/// tunnel gives its own, and not the proxy's `h2`.
+#[tokio::test]
+async fn tunnels_over_an_http2_proxy_give_its_sockets_addresses() {
+    let (first, second) = (origin().await, origin().await);
+    let proxy = proxy(H2_AND_HTTP1, None).await;
+    let reading = Reading::default();
+    let config = wreq::Proxy::all(&proxy.url).unwrap().alpn_protocols(BOTH);
+    let client = Client::builder()
+        .proxy(config)
+        .connector_layer(reading.clone())
+        .tls_cert_verification(false)
+        .build()
+        .unwrap();
+    assert_eq!(get(&client, first).await.unwrap(), first.to_string());
+    assert_eq!(get(&client, second).await.unwrap(), second.to_string());
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1);
+    let read = reading.0.lock().unwrap().clone();
+    let peer: std::net::SocketAddr = proxy.url["https://".len()..].parse().unwrap();
+    assert_eq!(read.len(), 2);
+    for (addresses, h2) in &read {
+        let (_, to) = addresses.expect("the socket's addresses");
+        assert_eq!((to, *h2), (peer, false));
+    }
+    assert_eq!(read[0].0, read[1].0, "one socket");
+}

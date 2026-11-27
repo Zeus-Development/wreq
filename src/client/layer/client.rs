@@ -194,8 +194,9 @@ where
                 http1_options,
                 http2_options,
                 socket_bind_options,
-                new_connection, // VIPER-PATCH(connection-reuse)
-                connect_fields, // VIPER-PATCH(request-connect-fields)
+                new_connection,   // VIPER-PATCH(connection-reuse)
+                connect_fields,   // VIPER-PATCH(request-connect-fields)
+                proxy_connection, // VIPER-PATCH(connect-407-retry)
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
             this.config.new_connection = new_connection; // VIPER-PATCH(connection-reuse)
 
@@ -209,6 +210,7 @@ where
             // VIPER-PATCH(request-connect-fields): with the tunnel's fields.
             let (tls, socket) = (tls_options, socket_bind_options);
             ConnectionDescriptor::new(uri, group, proxy, version, tls, socket, connect_fields)
+                .with_proxy_connection(proxy_connection) // VIPER-PATCH(connect-407-retry)
         };
 
         Box::pin(this.send_request(req, descriptor).map_err(Into::into))

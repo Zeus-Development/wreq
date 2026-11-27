@@ -152,14 +152,22 @@ impl<C> TunnelConnector<C> {
 
     // VIPER-PATCH(h2-proxy-connect): an HTTP/1.1 `CONNECT` on a connection
     // to the proxy already made (one that did not select `h2`).
-    pub(crate) async fn tunnel_over<T>(&self, conn: T, dst: &Uri) -> Result<T, TunnelError>
+    // VIPER-PATCH(connect-407-retry): a 407 that leaves the connection open
+    // puts it in `kept`, for the caller's retry.
+    pub(crate) async fn tunnel_over<T>(
+        &self,
+        conn: T,
+        dst: &Uri,
+        kept: &mut Option<T>,
+    ) -> Result<T, TunnelError>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let host = dst.host().ok_or(TunnelError::MissingHost)?;
         // VIPER-PATCH(connect-head-fields): with the order.
         let head = (&self.headers, self.order.as_ref());
-        tunnel(conn, host, dst.port_or_default(), head).await
+        // VIPER-PATCH(connect-407-retry): where a 407 keeps the connection.
+        tunnel(conn, host, dst.port_or_default(), head, Some(kept)).await
     }
 }
 
@@ -198,6 +206,7 @@ where
                     dst.host().ok_or(TunnelError::MissingHost)?,
                     dst.port_or_default(),
                     (&headers, order.as_ref()), // VIPER-PATCH(connect-head-fields)
+                    None,                       // VIPER-PATCH(connect-407-retry)
                 )
                 .await
             }),
@@ -207,11 +216,13 @@ where
 }
 
 // VIPER-PATCH(connect-head-fields): the head's order with its fields.
+// VIPER-PATCH(connect-407-retry): and where a 407 keeps the connection.
 async fn tunnel<T>(
     conn: T,
     host: &str,
     port: u16,
     (headers, order): (&Headers, Option<&OrigHeaderMap>),
+    kept: Option<&mut Option<T>>, // VIPER-PATCH(connect-407-retry)
 ) -> Result<T, TunnelError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -221,7 +232,7 @@ where
     // order's order and case, `Host` first when the order does not name it.
     if let Some(order) = order {
         ordered(&mut buf, (host, port), headers, order)?;
-        return handshake(conn, buf).await;
+        return handshake(conn, buf, kept).await; // VIPER-PATCH(connect-407-retry)
     }
     buf.extend_from_slice(format!("Host: {host}:{port}\r\n").as_bytes());
 
@@ -245,7 +256,7 @@ where
     // headers end
     buf.extend_from_slice(b"\r\n");
     // VIPER-PATCH(connect-head-fields): the head written, its answer read.
-    handshake(conn, buf).await
+    handshake(conn, buf, kept).await // VIPER-PATCH(connect-407-retry)
 }
 
 // VIPER-PATCH(connect-head-fields): the head's fields, `Host` among them,
@@ -282,7 +293,13 @@ fn ordered(
 
 // VIPER-PATCH(connect-head-fields): the head's write and its answer, as
 // before, apart from the head's fields.
-async fn handshake<T>(mut conn: T, buf: Vec<u8>) -> Result<T, TunnelError>
+// VIPER-PATCH(connect-407-retry): a 407 whose connection stays open, its
+// body read, puts it in `kept`.
+async fn handshake<T>(
+    mut conn: T,
+    buf: Vec<u8>,
+    kept: Option<&mut Option<T>>,
+) -> Result<T, TunnelError>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -300,12 +317,24 @@ where
         let mut res = httparse::Response::new(&mut headers);
         match res.parse(&buf).map_err(TunnelError::Parse)? {
             httparse::Status::Partial => continue,
-            httparse::Status::Complete(_) => match res.code {
+            // VIPER-PATCH(connect-407-retry): the head's length.
+            httparse::Status::Complete(end) => match res.code {
                 Some(200) => return Ok(conn),
                 // VIPER-PATCH(connect-challenge-fields): with its fields,
                 // its `Proxy-Authenticate` challenges among them (RFC 9110
                 // section 11.7.1).
-                Some(407) => return Err(TunnelError::ProxyAuthRequired(fields(res.headers))),
+                Some(407) => {
+                    let fields = fields(res.headers);
+                    // VIPER-PATCH(connect-407-retry): kept open when its
+                    // head lets it be and its body is read.
+                    let body = reusable(&res).map(|length| (length, buf.len() - end));
+                    if let (Some(kept), Some((length, read))) = (kept, body)
+                        && drain(&mut conn, length, read).await
+                    {
+                        *kept = Some(conn);
+                    }
+                    return Err(TunnelError::ProxyAuthRequired(fields));
+                }
                 // VIPER-PATCH(typed-proxy-errors): the status is kept.
                 code => {
                     let status = code.and_then(|code| StatusCode::from_u16(code).ok());
@@ -314,6 +343,46 @@ where
             },
         }
     }
+}
+
+// VIPER-PATCH(connect-407-retry): the largest 407 body read to keep its
+// connection; a larger one closes it.
+const DRAINED: usize = 64 * 1024;
+
+// VIPER-PATCH(connect-407-retry): the body length of a 407 whose connection
+// stays open after it: HTTP/1.1 without `Connection: close` (RFC 9112
+// section 9.3), its body framed by one `Content-Length` of at most `DRAINED`
+// bytes and no `Transfer-Encoding` (section 6.3); `None` otherwise.
+fn reusable(res: &httparse::Response<'_, '_>) -> Option<usize> {
+    let named = |name: &'static str| {
+        let headers = res.headers.iter();
+        headers.filter(move |header| header.name.eq_ignore_ascii_case(name))
+    };
+    let close = |header: &httparse::Header<'_>| {
+        let mut tokens = header.value.split(|byte| *byte == b',');
+        tokens.any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
+    };
+    if res.version != Some(1) || named("connection").any(close) {
+        return None;
+    }
+    if named("transfer-encoding").next().is_some() {
+        return None;
+    }
+    let mut lengths = named("content-length");
+    let length = std::str::from_utf8(lengths.next()?.value).ok()?;
+    let length: usize = length.trim().parse().ok()?;
+    (lengths.next().is_none() && length <= DRAINED).then_some(length)
+}
+
+// VIPER-PATCH(connect-407-retry): reads the rest of a 407's `length`-byte
+// body, `read` bytes of which came with its head; false when the proxy
+// closed first or sent more than the body.
+async fn drain<T: AsyncRead + Unpin>(conn: &mut T, length: usize, read: usize) -> bool {
+    let Some(rest) = length.checked_sub(read) else {
+        return false;
+    };
+    let mut rest = vec![0; rest];
+    conn.read_exact(&mut rest).await.is_ok()
 }
 
 // VIPER-PATCH(connect-challenge-fields): a head's parsed fields; one that is

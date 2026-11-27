@@ -18,6 +18,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower::{BoxError, Service};
 use wreq_proto::{
     conn::http2::{Builder, SendRequest},
+    // VIPER-PATCH(h2-proxy-profile): the client's options.
+    http2::Http2Options,
     // VIPER-PATCH(connect-head-fields): sorts the `CONNECT` stream's fields.
     ext::OnPreserveHeaderCallback,
     rt::Executor as _,
@@ -26,7 +28,8 @@ use wreq_proto::{
 
 use super::tunnel::TunnelError;
 use crate::{
-    conn::{Connected, Connection, TlsConn, tls_info::TlsInfoFactory},
+    // VIPER-PATCH(h2-proxy-addresses): the socket's addresses.
+    conn::{Connected, Connection, TlsConn, http::HttpInfo, tls_info::TlsInfoFactory},
     ext::UriExt,
     // VIPER-PATCH(connect-head-fields): the `CONNECT` head's order.
     header::OrigHeaderMap,
@@ -41,7 +44,20 @@ use crate::{
 /// The open HTTP/2 connections to proxies, one per proxy (its URI,
 /// credentials, headers and ALPN list); a closed one is dropped when the
 /// next tunnel looks for its proxy.
-pub(crate) type Shared = Arc<Mutex<Vec<(Intercept, SendRequest<Empty<Bytes>>)>>>;
+// VIPER-PATCH(h2-proxy-profile): with the options they open with.
+// VIPER-PATCH(h2-proxy-addresses): each with its socket's addresses.
+#[derive(Clone, Default)]
+pub(crate) struct Shared {
+    open: Arc<Mutex<Vec<Open>>>,
+    /// The HTTP/2 options each connection to a proxy opens with: the
+    /// client's own, as its connections to origins do; `None` for
+    /// wreq-proto's defaults.
+    pub(crate) options: Option<Http2Options>,
+}
+
+// VIPER-PATCH(h2-proxy-addresses): an open connection: its proxy, its
+// sender and its socket's addresses.
+type Open = (Intercept, SendRequest<Empty<Bytes>>, Option<HttpInfo>);
 
 /// A tunnel's first leg: a `CONNECT` stream, or a connection to the proxy
 /// that did not select `h2`, for an HTTP/1.1 `CONNECT`.
@@ -75,8 +91,9 @@ where
 {
     let host = dst.host().ok_or(TunnelError::MissingHost)?;
     let authority = format!("{host}:{}", dst.port_or_default());
-    let mut sender = match find(shared, proxy) {
-        Some(sender) => sender,
+    // VIPER-PATCH(h2-proxy-addresses): with the socket's addresses.
+    let (mut sender, info) = match find(shared, proxy) {
+        Some(found) => found,
         None => {
             connector.proxy_alpn(alpn);
             let io = connector
@@ -89,10 +106,13 @@ where
             if stream.ssl().selected_alpn_protocol() != Some(b"h2".as_slice()) {
                 return Ok(Opened::Http1(MaybeHttpsStream::Https(stream)));
             }
-            let sender = handshake(TlsConn { stream }).await?;
-            let mut list = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            list.push((proxy.clone(), sender.clone()));
-            sender
+            // VIPER-PATCH(h2-proxy-addresses): the TCP socket's, below TLS.
+            let info = http_info(stream.get_ref());
+            // VIPER-PATCH(h2-proxy-profile): with the client's options.
+            let sender = handshake(TlsConn { stream }, shared.options.clone()).await?;
+            let mut list = shared.open.lock().unwrap_or_else(PoisonError::into_inner);
+            list.push((proxy.clone(), sender.clone(), info.clone()));
+            (sender, info)
         }
     };
     let mut request = Request::builder().method(Method::CONNECT).uri(authority);
@@ -125,7 +145,8 @@ where
         status => return Err(TunnelError::TunnelUnsuccessful(Some(status))),
     }
     let upgraded = upgrade::on(response).await.map_err(failed)?;
-    Ok(Opened::Stream(H2Tunnel(Mutex::new(upgraded))))
+    // VIPER-PATCH(h2-proxy-addresses): with the socket's addresses.
+    Ok(Opened::Stream(H2Tunnel(Mutex::new(upgraded), info)))
 }
 
 /// A failure of the HTTP/2 connection or stream, after the connection to
@@ -135,21 +156,44 @@ fn failed(error: impl Into<BoxError>) -> TunnelError {
 }
 
 /// A clone of `proxy`'s open connection, after dropping closed ones.
-fn find(shared: &Shared, proxy: &Intercept) -> Option<SendRequest<Empty<Bytes>>> {
-    let mut list = shared.lock().unwrap_or_else(PoisonError::into_inner);
-    list.retain(|(_, sender)| !sender.is_closed());
-    let found = list.iter().find(|(key, _)| key == proxy);
-    found.map(|(_, sender)| sender.clone())
+// VIPER-PATCH(h2-proxy-addresses): with its socket's addresses.
+fn find(
+    shared: &Shared,
+    proxy: &Intercept,
+) -> Option<(SendRequest<Empty<Bytes>>, Option<HttpInfo>)> {
+    let mut list = shared.open.lock().unwrap_or_else(PoisonError::into_inner);
+    list.retain(|(_, sender, _)| !sender.is_closed());
+    let found = list.iter().find(|(key, _, _)| key == proxy);
+    found.map(|(_, sender, info)| (sender.clone(), info.clone()))
+}
+
+// VIPER-PATCH(h2-proxy-addresses): the local and peer addresses `io`'s
+// connection gives, if any.
+fn http_info(io: &impl Connection) -> Option<HttpInfo> {
+    let mut extensions = http::Extensions::new();
+    io.connected().set_extras(&mut extensions);
+    extensions.remove::<HttpInfo>()
 }
 
 /// The HTTP/2 handshake with the proxy, its connection driven on the
-/// runtime's executor, with wreq-proto's default HTTP/2 settings.
-async fn handshake<T>(io: T) -> Result<SendRequest<Empty<Bytes>>, TunnelError>
+/// runtime's executor.
+// VIPER-PATCH(h2-proxy-profile): with `options` (SETTINGS and their order,
+// the connection window, the HEADERS priority and pseudo-header order), or
+// wreq-proto's defaults without them.
+async fn handshake<T>(
+    io: T,
+    options: Option<Http2Options>,
+) -> Result<SendRequest<Empty<Bytes>>, TunnelError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let exec = Executor::default();
-    let (mut sender, conn) = Builder::new(exec.clone())
+    // VIPER-PATCH(h2-proxy-profile): the client's options, if any.
+    let mut builder = Builder::new(exec.clone());
+    if let Some(options) = options {
+        builder = builder.options(options);
+    }
+    let (mut sender, conn) = builder
         .handshake(io)
         .await
         .map_err(failed)?;
@@ -163,7 +207,9 @@ where
 /// One `CONNECT` stream as a byte stream. The mutex only makes it `Sync`, as
 /// the connector's streams must be; it is never locked, since every use
 /// holds `&mut`.
-pub(crate) struct H2Tunnel(Mutex<Upgraded>);
+// VIPER-PATCH(h2-proxy-addresses): with the addresses of the socket to the
+// proxy.
+pub(crate) struct H2Tunnel(Mutex<Upgraded>, Option<HttpInfo>);
 
 impl H2Tunnel {
     fn stream(self: Pin<&mut Self>) -> Pin<&mut Upgraded> {
@@ -205,8 +251,16 @@ impl AsyncWrite for H2Tunnel {
 }
 
 impl Connection for H2Tunnel {
+    // VIPER-PATCH(h2-proxy-addresses): the addresses of the socket to the
+    // proxy, as an HTTP/1.1 tunnel gives its socket's, so a caller learns
+    // which source port the tunnel holds; never the proxy's ALPN, which is
+    // not the tunnel's.
     fn connected(&self) -> Connected {
-        Connected::new()
+        // VIPER-PATCH(h2-proxy-addresses): the socket's addresses.
+        match &self.1 {
+            Some(info) => Connected::new().extra(info.clone()),
+            None => Connected::new(),
+        }
     }
 }
 

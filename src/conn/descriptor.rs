@@ -17,6 +17,8 @@ use crate::{
 };
 // VIPER-PATCH(connect-head-fields): the `CONNECT` head's order.
 use crate::header::OrigHeaderMap;
+// VIPER-PATCH(connect-407-retry): a connection kept after a 407.
+use crate::ProxyConnection;
 
 /// A key that uniquely identifies a group of interchangeable connections for pooling.
 ///
@@ -40,6 +42,9 @@ pub(crate) struct ConnectionDescriptor {
     socket_bind: Option<SocketBindOptions>,
     // VIPER-PATCH(request-connect-fields): the tunnel's `CONNECT` fields.
     connect_fields: Option<ConnectFields>,
+    // VIPER-PATCH(connect-407-retry): a retry's kept connection, not part
+    // of the key.
+    proxy_connection: Option<ProxyConnection>,
     connection_id: ConnectionId,
 }
 
@@ -108,8 +113,22 @@ impl ConnectionDescriptor {
             tls_options,
             socket_bind,
             connect_fields,
+            proxy_connection: None, // VIPER-PATCH(connect-407-retry)
             connection_id,
         }
+    }
+
+    // VIPER-PATCH(connect-407-retry): the connection a proxy's 407 left open
+    // that this connection's tunnel may take.
+    pub(crate) fn with_proxy_connection(mut self, kept: Option<ProxyConnection>) -> Self {
+        self.proxy_connection = kept;
+        self
+    }
+
+    // VIPER-PATCH(connect-407-retry): that connection, if any.
+    #[inline]
+    pub(crate) fn proxy_connection(&self) -> Option<&ProxyConnection> {
+        self.proxy_connection.as_ref()
     }
 
     /// Returns a [`ConnectionId`] group ID for this descriptor.

@@ -849,6 +849,23 @@ impl RequestBuilder {
         self
     }
 
+    // VIPER-PATCH(connect-407-retry): a browser retries a challenged
+    // `CONNECT` with credentials on the connection the 407 came on.
+    /// Writes this request's tunnel `CONNECT` on `connection`, the one a
+    /// proxy's 407 left open ([`ProxyFailure::connection`](crate::ProxyFailure::connection)),
+    /// when the tunnel goes through the same proxy, with the same
+    /// credentials and custom headers, to the same authority, and the proxy
+    /// has not closed it; otherwise the tunnel opens a new connection, as
+    /// without it. Not part of the pool key: a pooled connection for the
+    /// request is still taken first.
+    pub fn proxy_connection(mut self, connection: crate::ProxyConnection) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            let options = req.config_mut::<RequestOptions>().get_or_insert_default();
+            options.proxy_connection = Some(connection);
+        }
+        self
+    }
+
     // VIPER-PATCH(connect-head-fields): a browser writes its `CONNECT`
     // head's fields in its own order and case.
     /// Writes the HTTP/1.1 `CONNECT` head of this request's tunnel with its

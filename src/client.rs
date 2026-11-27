@@ -604,6 +604,8 @@ impl ClientBuilder {
             };
 
             let connector = ConnectorBuilder::new(config.proxies, resolver)
+                // VIPER-PATCH(h2-proxy-profile): for proxies that select `h2`.
+                .http2_options(config.http2_options.clone())
                 .timer(config.timer.clone())
                 .timeout(config.connect_timeout)
                 .tls_info(config.tls_info)

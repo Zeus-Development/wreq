@@ -24,6 +24,13 @@ use super::{
     timeout::{Timeout, TimeoutLayer},
     verbose::Verbose,
 };
+// VIPER-PATCH(h2-proxy-profile): the client's HTTP/2 options.
+use wreq_proto::http2::Http2Options;
+// VIPER-PATCH(connect-407-retry): a connection kept after a 407.
+use http::Uri;
+
+use super::proxy::kept::{ProxyConnection, ProxyStream};
+
 use crate::{
     dns::DynResolver,
     error::{ProxyConnect, map_timeout_to_connector_error},
@@ -114,6 +121,13 @@ impl ConnectorBuilder {
             http: HttpConnector::new(resolver, TcpConnector::new()),
             builder: TlsConnector::builder(),
         }
+    }
+
+    // VIPER-PATCH(h2-proxy-profile): the HTTP/2 options of the client's
+    // connections to proxies that select `h2`, the same as to origins.
+    pub(crate) fn http2_options(mut self, options: Option<Http2Options>) -> ConnectorBuilder {
+        self.config.h2_proxies.options = options;
+        self
     }
 
     /// Set the HTTP connector to use.
@@ -221,6 +235,27 @@ impl ConnectorBuilder {
 
         Ok(Either::Right(service))
     }
+}
+
+// VIPER-PATCH(connect-407-retry): the tunnel's `CONNECT` on `conn`; a 407
+// that leaves the connection open gives it back on the failure, kept for a
+// retry through `proxy` to `dst`.
+async fn keep(
+    tunnel: &proxy::tunnel::TunnelConnector<HttpsConnector<HttpConnector>>,
+    conn: ProxyStream,
+    (dst, proxy): (&Uri, &Intercept),
+) -> Result<ProxyStream, proxy::failure::ProxyFailure> {
+    let mut kept = None;
+    let tunnelled = tunnel.tunnel_over(conn, dst, &mut kept).await;
+    tunnelled.map_err(|error| {
+        let kept = kept.map(|conn| ProxyConnection::new(conn, proxy, authority(dst)));
+        proxy::failure::ProxyFailure::from(error).with_connection(kept)
+    })
+}
+
+// VIPER-PATCH(connect-407-retry): a `CONNECT`'s authority, `host:port`.
+fn authority(dst: &Uri) -> String {
+    format!("{}:{}", dst.host().unwrap_or_default(), dst.port_or_default())
 }
 
 // ===== impl TransportConnector =====
@@ -419,8 +454,11 @@ impl TransportConnector {
 
                     // Build a tunnel connector to establish the CONNECT tunnel.
                     let tunneled = {
-                        let mut tunnel =
-                            proxy::tunnel::TunnelConnector::new(proxy_uri, connector.clone());
+                        // VIPER-PATCH(connect-407-retry): the proxy's URI kept.
+                        let mut tunnel = proxy::tunnel::TunnelConnector::new(
+                            proxy_uri.clone(), // VIPER-PATCH(connect-407-retry)
+                            connector.clone(),
+                        );
 
                         // If the proxy requires basic authentication, add it to the tunnel.
                         if let Some(auth) = proxy.basic_auth() {
@@ -442,9 +480,16 @@ impl TransportConnector {
                         let order = descriptor.connect_order().cloned();
                         tunnel = tunnel.with_order(order.clone());
 
+                        // VIPER-PATCH(connect-407-retry): first the connection
+                        // a 407 left open, if the retry goes where it was kept for.
+                        let kept = descriptor.proxy_connection();
+                        let kept = kept.and_then(|kept| kept.take(&proxy, &authority(&uri)));
                         // VIPER-PATCH(h2-proxy-connect): a CONNECT stream, else
                         // HTTP/1.1 on the connection made with the list.
-                        if let Some(alpn) = h2_alpn {
+                        // VIPER-PATCH(connect-407-retry): the kept one first.
+                        if let Some(conn) = kept {
+                            keep(&tunnel, conn, (&uri, &proxy)).await?
+                        } else if let Some(alpn) = h2_alpn {
                             let shared = &self.config.h2_proxies;
                             let opened = proxy::h2::open(
                                 shared,
@@ -460,18 +505,23 @@ impl TransportConnector {
                                     let io = connector.call(conn).await?;
                                     return self.tunnel_conn_from_stream(io);
                                 }
-                                proxy::h2::Opened::Http1(conn) => tunnel
-                                    .tunnel_over(conn, &uri)
-                                    .await
-                                    .map_err(proxy::failure::ProxyFailure::from)?,
+                                // VIPER-PATCH(connect-407-retry): kept on a 407.
+                                proxy::h2::Opened::Http1(conn) => {
+                                    keep(&tunnel, conn, (&uri, &proxy)).await?
+                                }
                             }
                         } else {
                             // Connect to the proxy and establish the tunnel.
                             // VIPER-PATCH(typed-proxy-errors): typed.
-                            tunnel
-                                .call(uri)
-                                .await
-                                .map_err(proxy::failure::ProxyFailure::from)?
+                            // VIPER-PATCH(connect-407-retry): connected here, so
+                            // that a 407 can keep the connection.
+                            let connecting = connector.call(proxy_uri).await;
+                            let failed = |error: BoxError| {
+                                let error = proxy::tunnel::TunnelError::ConnectFailed(error);
+                                proxy::failure::ProxyFailure::from(error)
+                            };
+                            let conn = connecting.map_err(failed)?;
+                            keep(&tunnel, conn, (&uri, &proxy)).await?
                         }
                     };
 

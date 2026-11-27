@@ -8,6 +8,8 @@ use std::{error::Error as StdError, fmt};
 use http::{HeaderMap, StatusCode};
 
 use crate::error::BoxError;
+// VIPER-PATCH(connect-407-retry): a connection kept after a 407.
+use super::kept::ProxyConnection;
 
 /// A failed connection through a proxy.
 ///
@@ -23,6 +25,8 @@ pub struct ProxyFailure {
     source: BoxError,
     // VIPER-PATCH(connect-challenge-fields): a 407's fields.
     fields: Option<Box<HeaderMap>>,
+    // VIPER-PATCH(connect-407-retry): the connection a 407 left open.
+    connection: Option<ProxyConnection>,
 }
 
 /// What failed in a connection through a proxy.
@@ -63,7 +67,25 @@ impl ProxyFailure {
             kind,
             source: source.into(),
             fields: None,
+            connection: None, // VIPER-PATCH(connect-407-retry)
         }
+    }
+
+    // VIPER-PATCH(connect-407-retry): keeps the connection a 407 left open.
+    pub(crate) fn with_connection(mut self, connection: Option<ProxyConnection>) -> Self {
+        self.connection = connection;
+        self
+    }
+
+    /// The connection to the HTTP proxy that its 407 answer to `CONNECT`
+    /// over HTTP/1.1 left open, its body read, for the retry with
+    /// credentials to go on
+    /// ([`RequestBuilder::proxy_connection`](crate::RequestBuilder::proxy_connection));
+    /// `None` for any other failure, or when the 407 closed or may close
+    /// the connection.
+    // VIPER-PATCH(connect-407-retry): the kept connection.
+    pub fn connection(&self) -> Option<ProxyConnection> {
+        self.connection.clone()
     }
 
     // VIPER-PATCH(connect-challenge-fields): keeps a 407's fields.

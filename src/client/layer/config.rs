@@ -122,6 +122,8 @@ pub(crate) struct RequestOptions {
     pub new_connection: bool,
     // VIPER-PATCH(request-connect-fields): the tunnel's `CONNECT` fields.
     pub connect_fields: Option<ConnectFields>,
+    // VIPER-PATCH(connect-407-retry): a connection a 407 left open.
+    pub proxy_connection: Option<crate::ProxyConnection>,
 }
 
 /// Configuration for the [`ConfigService`].
