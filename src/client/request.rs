@@ -842,8 +842,9 @@ impl RequestBuilder {
     pub fn connect_headers(mut self, headers: HeaderMap) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             let options = req.config_mut::<RequestOptions>().get_or_insert_default();
-            let order = options.connect_fields.take().and_then(|fields| fields.1);
-            options.connect_fields = Some(ConnectFields(headers, order));
+            // VIPER-PATCH(ws-tunnel): the forced tunnel is kept.
+            let ConnectFields(_, order, tunnel) = options.connect_fields.take().unwrap_or_default();
+            options.connect_fields = Some(ConnectFields(headers, order, tunnel));
         }
         self
     }
@@ -859,8 +860,27 @@ impl RequestBuilder {
     pub fn connect_order(mut self, order: OrigHeaderMap) -> RequestBuilder {
         if let Ok(ref mut req) = self.request {
             let options = req.config_mut::<RequestOptions>().get_or_insert_default();
-            let fields = options.connect_fields.take().map(|fields| fields.0);
-            options.connect_fields = Some(ConnectFields(fields.unwrap_or_default(), Some(order)));
+            // VIPER-PATCH(ws-tunnel): the forced tunnel is kept.
+            let ConnectFields(fields, _, tunnel) = options.connect_fields.take().unwrap_or_default();
+            options.connect_fields = Some(ConnectFields(fields, Some(order), tunnel));
+        }
+        self
+    }
+
+    // VIPER-PATCH(ws-tunnel): a WebSocket client should tunnel through an
+    // HTTP proxy with `CONNECT` whatever its URL's scheme (RFC 6455 section
+    // 4.1, "If /secure/ is false ... the client SHOULD ... use CONNECT").
+    /// Opens this request's connection through an HTTP or HTTPS proxy as a
+    /// `CONNECT` tunnel also for an `http` URL, without TLS inside the
+    /// tunnel, and sends the request in origin form with no proxy
+    /// credentials, instead of forwarding it in absolute form. Part of the
+    /// connection's pool key, as [`connect_headers`](Self::connect_headers).
+    /// An `https` URL, a SOCKS proxy or no proxy change nothing.
+    pub fn force_tunnel(mut self, tunnel: bool) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            let options = req.config_mut::<RequestOptions>().get_or_insert_default();
+            let ConnectFields(fields, order, _) = options.connect_fields.take().unwrap_or_default();
+            options.connect_fields = Some(ConnectFields(fields, order, tunnel));
         }
         self
     }

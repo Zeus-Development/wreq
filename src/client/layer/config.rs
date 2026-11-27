@@ -59,9 +59,10 @@ impl VersionFields {
 // opens one request's tunnel through an HTTP proxy, part of its connection's
 // key.
 /// Fields of the `CONNECT` request of a request's tunnel.
-#[derive(Debug, Clone)] // VIPER-PATCH(connect-head-fields): equality below
+#[derive(Debug, Clone, Default)] // VIPER-PATCH(ws-tunnel): and a default
 // VIPER-PATCH(connect-head-fields): and the head's order and case.
-pub(crate) struct ConnectFields(pub HeaderMap, pub Option<OrigHeaderMap>);
+// VIPER-PATCH(ws-tunnel): and whether an `http` destination tunnels too.
+pub(crate) struct ConnectFields(pub HeaderMap, pub Option<OrigHeaderMap>, pub bool);
 
 // VIPER-PATCH(connect-head-fields): `OrigHeaderMap`'s own equality ignores
 // the order of its names, which is the head's order here: two orders are
@@ -75,7 +76,8 @@ impl PartialEq for ConnectFields {
             }
             (mine, theirs) => mine.is_none() && theirs.is_none(),
         };
-        self.0 == other.0 && same
+        // VIPER-PATCH(ws-tunnel): a forced tunnel is keyed apart.
+        self.0 == other.0 && same && self.2 == other.2
     }
 }
 
@@ -97,6 +99,8 @@ impl Hash for ConnectFields {
         for (_, case) in self.1.iter().flat_map(OrigHeaderMap::iter) {
             case.hash(state);
         }
+        // VIPER-PATCH(ws-tunnel): a forced tunnel is keyed apart.
+        self.2.hash(state);
     }
 }
 

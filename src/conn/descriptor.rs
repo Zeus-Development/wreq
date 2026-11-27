@@ -160,6 +160,12 @@ impl ConnectionDescriptor {
         self.connect_fields.as_ref().and_then(|fields| fields.1.as_ref())
     }
 
+    // VIPER-PATCH(ws-tunnel): whether an `http` destination tunnels too.
+    #[inline]
+    pub(crate) fn force_tunnel(&self) -> bool {
+        self.connect_fields.as_ref().is_some_and(|fields| fields.2)
+    }
+
     /// Return a reference to the [`SocketBindOptions`].
     #[inline]
     pub(crate) fn socket_bind_options(&self) -> Option<&SocketBindOptions> {

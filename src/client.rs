@@ -485,7 +485,7 @@ impl Client {
         headers: HeaderMap,
         order: Option<OrigHeaderMap>,
     ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
-        let fields = Some(ConnectFields(headers, order));
+        let fields = Some(ConnectFields(headers, order, false)); // VIPER-PATCH(ws-tunnel)
         self.preconnect_fields(uri, count, group, fields)
     }
 

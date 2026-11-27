@@ -405,7 +405,9 @@ impl TransportConnector {
                     }
                 }
 
-                if is_https {
+                // VIPER-PATCH(ws-tunnel): or when the request forces a
+                // tunnel, with no TLS inside it for an `http` destination.
+                if is_https || descriptor.force_tunnel() {
                     trace!("tunneling over HTTP(s) proxy: {:?}", proxy_uri);
 
                     // Build an HTTPS connector.
