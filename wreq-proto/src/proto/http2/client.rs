@@ -517,11 +517,20 @@ where
         // VIPER-PATCH(h2-informational): each interim (1xx) response that
         // came before the final one goes to the request's callback, in the
         // order received, as the HTTP/1 client does (RFC 9110 section 15.2,
-        // RFC 9113 section 8.1). Without a callback they are skipped, as
-        // before.
+        // RFC 9113 section 8.1). The final head is polled only once
+        // `poll_informational` is `Ready(None)` (that head at the front, or
+        // the stream closed): http2's `poll_response` drops interim heads it
+        // finds first, so an interim head the connection queued between the
+        // two calls would be lost. An error is left to `poll` to report.
+        // Without a callback they are skipped, as before.
         if let Some(callback) = this.on_informational.as_ref() {
-            while let Poll::Ready(Some(Ok(res))) = this.fut.as_mut().poll_informational(cx) {
-                callback.call(res);
+            loop {
+                match this.fut.as_mut().poll_informational(cx) {
+                    Poll::Ready(Some(Ok(res))) => callback.call(res),
+                    Poll::Ready(None) | Poll::Ready(Some(Err(_))) => break,
+                    // Nothing queued yet; the stream's waker is registered.
+                    Poll::Pending => return Poll::Pending,
+                }
             }
         }
 
