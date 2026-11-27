@@ -69,6 +69,9 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `connection-reuse` | a request that failed on a connection checked out of the pool says so (`Error::is_connection_reused`), and a request may ask for a new connection instead of an idle one (`RequestBuilder::new_connection`; over HTTP/2 with the limits in its section), so a client can send an idempotent request again on a new connection after its connection closed before the response (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_connection_reuse.rs`; Viper: `viper-net::resend a_reused_connection_closed_before_the_response_is_sent_again` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `async-verify-evidence` | the caller's certificate check runs inside the handshake, as the TLS library's custom verification after the library's own chain and name verification (mirrored exactly), sees the stapled OCSP response (RFC 6066 section 8) and the SCT list of the TLS extension (RFC 6962 section 3.3), and may answer later through a future, the handshake waiting without blocking its thread (the library's `ssl_verify_retry`); its refusal ends the handshake with an alert, before any request byte | none | fork: `tests/viper_verify_hook.rs`; Viper: `viper-net::cert_verifier a_later_answer_lets_another_sessions_fetch_complete_meanwhile` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `pool-preconnect` | a client may open connections to an origin ahead of its requests (`Client::preconnect`): each takes the route a request with the client's own options takes (connector, proxy tunnel, TLS), joins the pool as an idle connection within its limits and reports its outcome, and a later request checks it out as any idle connection (HTML's `preconnect` link type) | none | fork: `tests/viper_pool_preconnect.rs`; Viper: `viper-net::preconnect a_preconnected_connection_serves_the_next_request` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `version-fields` | a request's fields may stay on its head only on a connection of listed HTTP versions (`RequestBuilder::version_fields`): once the connection is checked out, they are taken out of the head of a connection of another version, the other fields keeping their order, so a field meant for some versions only (RFC 9218's Priority) follows the version an ALPN offer of several protocols leaves to the server (RFC 7301 section 3.2) | none | fork: `tests/viper_version_fields.rs`; Viper: `viper-net::priority_versions an_https_head_offering_both_protocols_follows_the_version_the_server_picks` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `grouped-preconnect` | `Client::preconnect` may open its connections in a request group (`Group`), keyed as a request of that group is, so only such a request takes them; without one nothing changes | none | fork: `tests/viper_pool_preconnect.rs`; Viper: `viper-net::preconnect a_grouped_preconnect_serves_only_its_groups_requests` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `connector-layer-identity` | a connector layer can read the origin each connection is made for (`Unnameable::uri`) and give the connection a value it holds until it is dropped (`Conn::with_guard`); `Conn` and `Unnameable` are exported so a layer can name them | none | fork: `tests/viper_connector_layer.rs`; Viper: `viper-net::preconnect a_connector_layer_reads_the_origin_and_its_guard_drops_with_the_connection` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -246,6 +249,53 @@ options (a proxy, TLS options, a version, a group) has another pool key
 and does not take them. Nothing else changes: without a call the pool
 fills as before.
 
+## version-fields
+
+A request's fields were fixed before its connection was checked out, but
+the HTTP version of that connection is known only after checkout when the
+client offers several protocols through ALPN and the server picks one (RFC
+7301 section 3.2). A field meant for some versions only, such as RFC 9218's
+`Priority` for a client that writes it on HTTP/2 alone, could not be left
+out of the others' heads. With the patch,
+`RequestBuilder::version_fields(versions, headers)` (`src/client/request.rs`)
+adds the fields as `RequestBuilder::headers` does, in place of any of the
+same names, and keeps them beside the request (`VersionFields`,
+`src/client/layer/config.rs`). Once `try_send_request`
+(`src/client/layer/client.rs`) has the connection, it fits the head to the
+connection's version, `HTTP_2` or `HTTP_11` for an HTTP/1 connection: on a
+listed version the fields stay; on another the fields of their names are
+taken out and the others keep their order (the map is rebuilt, since a
+`HeaderMap` removal moves its last field). A retry on another connection
+fits the head again, putting the fields back at its end on a listed
+version. Nothing else changes: without the call a request is as before.
+
+## grouped-preconnect
+
+wreq partitions its pool by request group (`RequestBuilder::group`), but
+`pool-preconnect`'s `Client::preconnect` opened its connections with the
+options of a request of no group, so a client that partitions its
+connections could not open them ahead in a partition. With the patch
+`Client::preconnect(uri, count, group)` (`src/client.rs`) takes an optional
+`Group`: `HttpClient::preconnect` (`src/client/layer/client.rs`) adds it to
+the connection's group as `RequestBuilder::group` adds a request's, so the
+connections are keyed as a request of that group is and only such a
+request takes them. Without one nothing changes.
+
+## connector-layer-identity
+
+A connector layer (`ClientBuilder::connector_layer`) wraps the service that
+makes each connection, but that service's request (`Unnameable`) and
+response (`Conn`) were not named outside the crate, the request did not say
+what the connection is for, and a connection had no place for a layer's
+value. A layer could not count an origin's open connections. With the
+patch (`src/conn.rs`, `src/conn/connector.rs`, `src/lib.rs`),
+`Unnameable::uri` gives the origin the connection is made for (its scheme,
+host and port, the path `/`), `Conn::with_guard` keeps a value until the
+connection is dropped (when it closes, or when the pool drops it; a second
+guard replaces the first), and `Conn` and `Unnameable` are exported, so a
+layer can name them. Nothing else changes: a connection without a guard is
+as before.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -274,3 +324,4 @@ fills as before.
 | NET-RESEND-1 | the last commit of this range | the patch `connection-reuse` |
 | NET-CERT-SEAM-1 | the last commit of this range | the patch `async-verify-evidence` |
 | WREQ-PRECONNECT-1 | the last commit of this range | the patch `pool-preconnect` |
+| NET-WREQ-FORK-2 | the last commit of this range | the patches `version-fields`, `grouped-preconnect` and `connector-layer-identity` |
