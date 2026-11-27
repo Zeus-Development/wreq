@@ -401,3 +401,53 @@ async fn a_requests_connect_order_holds_and_keys_its_tunnel() {
         assert_eq!(*proxy.names.lock().unwrap(), expected);
     }
 }
+
+// VIPER-PATCH(preconnect-connect-fields): a tunnel opened ahead with a
+// request's `CONNECT` fields and order is keyed as that request's, so the
+// request takes it (one `CONNECT` in all), over HTTP/2 and HTTP/1.1; a
+// request without them opens its own.
+#[tokio::test]
+async fn a_preconnect_with_connect_fields_serves_the_request_with_them() {
+    for (select, alpn) in [
+        (H2_AND_HTTP1, BOTH),
+        (HTTP1_ONLY, &[AlpnProtocol::HTTP1][..]),
+    ] {
+        let origin = origin().await;
+        let proxy = proxy(select, None).await;
+        let config = wreq::Proxy::all(&proxy.url).unwrap().alpn_protocols(alpn);
+        let client = Client::builder()
+            .proxy(config)
+            .tls_cert_verification(false)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{origin}/");
+        let mut fields = http::HeaderMap::new();
+        fields.insert("user-agent", http::HeaderValue::from_static("Agent/1"));
+        let mut order = wreq::header::OrigHeaderMap::new();
+        order.insert("User-Agent");
+        let uri: http::Uri = url.parse().unwrap();
+        let opened = client
+            .preconnect_with_connect_fields(uri, 1, None, fields.clone(), Some(order.clone()))
+            .await;
+        assert!(opened.iter().all(Result::is_ok), "{opened:?}");
+        let request = client
+            .get(&url)
+            .connect_headers(fields)
+            .connect_order(order);
+        let body = request.send().await.unwrap().text().await.unwrap();
+        assert_eq!(body, origin.to_string());
+        assert_eq!(
+            proxy.names.lock().unwrap().len(),
+            1,
+            "the preconnected tunnel served it"
+        );
+        let body = client.get(&url).send().await.unwrap().text().await.unwrap();
+        assert_eq!(body, origin.to_string());
+        assert_eq!(
+            proxy.names.lock().unwrap().len(),
+            2,
+            "no fields, another key"
+        );
+    }
+}
+

@@ -48,7 +48,8 @@ use self::{
     future::Pending,
     layer::{
         client::HttpClient,
-        config::{ConfigService, ConfigServiceLayer},
+        // VIPER-PATCH(preconnect-connect-fields): a preconnect's tunnel fields.
+        config::{ConfigService, ConfigServiceLayer, ConnectFields},
         redirect::{FollowRedirect, FollowRedirectLayer},
         retry::RetryPolicy,
         timeout::{Timeout, TimeoutLayer, TimeoutOptions, body::TimeoutBody},
@@ -460,11 +461,44 @@ impl Client {
         count: usize,
         group: Option<Group>,
     ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
+        self.preconnect_fields(uri, count, group, None)
+    }
+
+    // VIPER-PATCH(preconnect-connect-fields): a preconnected tunnel is keyed
+    // and opened as a request's, so the request takes it.
+    /// As [`preconnect`](Self::preconnect), with the tunnel fields a request
+    /// sets with [`RequestBuilder::connect_headers`] and
+    /// [`RequestBuilder::connect_order`]: through an HTTP proxy, each
+    /// connection's `CONNECT` carries `headers` in `order`, and the
+    /// connection is pooled under the same key, so a later request with the
+    /// same fields and order takes it. Through no proxy, a SOCKS proxy or for
+    /// an `http` destination, they change nothing but the key.
+    pub fn preconnect_with_connect_fields(
+        &self,
+        uri: Uri,
+        count: usize,
+        group: Option<Group>,
+        headers: HeaderMap,
+        order: Option<OrigHeaderMap>,
+    ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
+        let fields = Some(ConnectFields(headers, order));
+        self.preconnect_fields(uri, count, group, fields)
+    }
+
+    // VIPER-PATCH(preconnect-connect-fields): both preconnects.
+    fn preconnect_fields(
+        &self,
+        uri: Uri,
+        count: usize,
+        group: Option<Group>,
+        fields: Option<ConnectFields>,
+    ) -> impl Future<Output = Vec<crate::Result<()>>> + Send + 'static {
         let connections = (0..count).map(|_| {
             let (client, uri, group) = (self.1.clone(), uri.clone(), group.clone());
+            let fields = fields.clone();
             async move {
                 client
-                    .preconnect(uri.clone(), group)
+                    .preconnect(uri.clone(), group, fields)
                     .await
                     .map_err(|err| Error::request(err).with_uri(uri))
             }

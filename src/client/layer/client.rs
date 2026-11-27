@@ -39,7 +39,8 @@ use {
 
 use self::lazy::{Started as Lazy, lazy};
 use crate::{
-    client::layer::config::{RequestOptions, VersionFields},
+    // VIPER-PATCH(preconnect-connect-fields): a preconnect's tunnel fields.
+    client::layer::config::{ConnectFields, RequestOptions, VersionFields},
     config::RequestConfig,
     conn::{
         Connected, Connection,
@@ -220,7 +221,13 @@ where
     // for a later request to that origin to check out as any idle one. Over
     // HTTP/2 the pool keeps one connection per destination: while one is
     // being made, a second preconnect waits for it and shares it.
-    pub(crate) async fn preconnect(&self, uri: Uri, in_group: Option<Group>) -> Result<(), Error> {
+    // VIPER-PATCH(preconnect-connect-fields): with a request's tunnel fields.
+    pub(crate) async fn preconnect(
+        &self,
+        uri: Uri,
+        in_group: Option<Group>,
+        connect_fields: Option<ConnectFields>,
+    ) -> Result<(), Error> {
         let mut req = Request::new(());
         *req.uri_mut() = uri;
         let uri = normalize_uri(&mut req, false)?;
@@ -237,9 +244,10 @@ where
         if let Some(own) = in_group {
             group.request(own);
         }
-        // VIPER-PATCH(request-connect-fields): a preconnect sets none.
+        // VIPER-PATCH(preconnect-connect-fields): the fields the caller gave.
         let (tls, socket) = (tls_options, socket_bind_options);
-        let descriptor = ConnectionDescriptor::new(uri, group, proxy, version, tls, socket, None);
+        let descriptor =
+            ConnectionDescriptor::new(uri, group, proxy, version, tls, socket, connect_fields);
         let mut this = self.clone();
         this.config.new_connection = true;
         let mut pooled = this.connection_for(descriptor).await?;
