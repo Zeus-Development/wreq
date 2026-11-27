@@ -75,6 +75,7 @@ other package, keeps its own version and is not built from this fork.
 | `content-length-values` | differing `Content-Length` values get their own parse error, told apart from an unreadable value (RFC 9112 section 6.3) | `adr:net-content-length-parse` | fork: `src/proto/http1/role.rs` `viper_content_length_tests`; Viper: `viper-net::fetch differing_content_length_values_are_told_from_an_unreadable_one` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `response-bytes` | an HTTP/1 request whose connection fails before the response head is complete (an end of stream, a failed read or a failed write) learns whether any response byte had arrived, an informational response or part of the head, so a client can tell an unanswered request from a partly answered one when it decides on an automatic retry (RFC 9112 section 9.3.1, RFC 9110 section 9.2.2) | none | fork: `tests/viper_response_bytes.rs`; Viper: `viper-net::resend basic_resends_only_before_any_response_byte` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `h2-informational` | the HTTP/2 client hands each interim (1xx) response, `103 Early Hints` among them, to the request's `on_informational` callback in the order received and before the final response, as the HTTP/1 client does (RFC 9110 section 15.2, RFC 9113 section 8.1) | `adr:net-early-hints` | fork: `tests/viper_h2_informational.rs`; Viper: `viper-net::early_hints http2_early_hints_reach_the_response_in_order` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `h2-priority-order` | the HTTP/2 client sends the requests it holds most urgent first (RFC 9218 section 4.1's urgency; the order sent within one), so their streams open, and their HEADERS frames go out, in that order with ascending ids (RFC 9113 section 5.1.1); and `Http2Options::urgency_priorities` passes http2's per-request HEADERS priority (`h2-stream-priority`) on | `adr:net-h2-priority-order` | fork: `tests/viper_h2_priority_order.rs`; Viper: `viper-net::transport_wire held_requests_are_written_most_urgent_first` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner's approval |
 
 ## header-count-growth
 
@@ -131,6 +132,28 @@ and the response future hands it each interim response before it polls for
 the final one, in the order received. A request without a callback gets
 its final response as before.
 
+## h2-priority-order
+
+http2 gives a stream its id when the request is sent (`send_request`), and
+a client opens its streams in ascending id order (RFC 9113 section 5.1.1),
+so the order in which the HTTP/2 client (`src/proto/http2/client.rs`)
+sends requests is the order of their HEADERS frames; it sent them in the
+order they reached its channel. With the patch, each time it looks for a
+request it takes every request the channel holds and keeps each after the
+held ones of the same or a lower urgency value (http2's `ext::Urgency`
+from the request's extensions, RFC 9218's default 3 without), and sends
+the most urgent first, in the order sent within one urgency. At the
+server's concurrent stream limit the request sent last waits to open with
+its id, and those after it wait in the channel, so they are ordered when
+it opens; a more urgent request that comes after that one still follows
+it. A connection whose requests carry no urgency sends them as before.
+`Http2Options::urgency_priorities` (and its builder method) hands http2's
+`client::Builder::urgency_priorities` its value, and `wreq_proto::http2`
+re-exports `Urgency`, `UrgencyParent` and `UrgencyPriorities`. The
+workspace builds http2 from Viper's fork (the branch `viper/http2-0.5.20`,
+its root `Cargo.toml`'s `[patch.crates-io]`); a Viper build takes http2
+from its own entry at the same rev.
+
 ## Rebase procedure
 
 1. A new wreq-proto release gets a new branch, `viper/wreq-proto-<version>`,
@@ -156,3 +179,4 @@ its final response as before.
 | V16d-3a | `ebb0c589afdb82f559df4000e6e26052f7daeb7f` | the branch, the base and the patches `header-count-growth` and `content-length-values` |
 | NET-RESEND-2 | the last commit of this range | the patch `response-bytes` |
 | WREQ-H2-PRIORITY-1 | the last commit of this range | the patch `h2-informational` |
+| WREQ-FORK-4 | the last commit of this range | the patch `h2-priority-order` |
