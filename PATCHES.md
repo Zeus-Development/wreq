@@ -72,6 +72,8 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `version-fields` | a request's fields may stay on its head only on a connection of listed HTTP versions (`RequestBuilder::version_fields`): once the connection is checked out, they are taken out of the head of a connection of another version, the other fields keeping their order, so a field meant for some versions only (RFC 9218's Priority) follows the version an ALPN offer of several protocols leaves to the server (RFC 7301 section 3.2) | none | fork: `tests/viper_version_fields.rs`; Viper: `viper-net::priority_versions an_https_head_offering_both_protocols_follows_the_version_the_server_picks` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `grouped-preconnect` | `Client::preconnect` may open its connections in a request group (`Group`), keyed as a request of that group is, so only such a request takes them; without one nothing changes | none | fork: `tests/viper_pool_preconnect.rs`; Viper: `viper-net::preconnect a_grouped_preconnect_serves_only_its_groups_requests` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connector-layer-identity` | a connector layer can read the origin each connection is made for (`Unnameable::uri`) and give the connection a value it holds until it is dropped (`Conn::with_guard`); `Conn` and `Unnameable` are exported so a layer can name them | none | fork: `tests/viper_connector_layer.rs`; Viper: `viper-net::preconnect a_connector_layer_reads_the_origin_and_its_guard_drops_with_the_connection` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `connect-challenge-fields` | an HTTP proxy's 407 answer to `CONNECT`, over HTTP/1.1 or as an HTTP/2 stream, keeps its fields on the failure (`ProxyFailure::headers`), its `Proxy-Authenticate` challenges among them, so a caller can answer them (RFC 9110 sections 15.5.8 and 11.7.1) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_connect_challenge.rs`, `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_tunnels_407_pauses_and_its_answer_goes_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `request-connect-fields` | a request may set the fields of the `CONNECT` that opens its own tunnel (`RequestBuilder::connect_headers`), in place of the proxy's of their names, its tunnel keyed apart in the pool, so a caller answers a proxy's challenge on that request's tunnel only (RFC 9110 sections 9.3.6 and 11.7.2) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_routes_refused_credentials_give_way_to_the_answer_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -296,6 +298,39 @@ guard replaces the first), and `Conn` and `Unnameable` are exported, so a
 layer can name them. Nothing else changes: a connection without a guard is
 as before.
 
+## connect-challenge-fields
+
+An HTTP proxy that answered a tunnel's `CONNECT` with 407 ended it as
+`TunnelError::ProxyAuthRequired` with nothing of its head, so a caller could
+not read the `Proxy-Authenticate` challenges it must answer (RFC 9110
+sections 15.5.8 and 11.7.1). With the patch, the HTTP/1.1 tunnel
+(`src/conn/proxy/tunnel.rs`) keeps the 407's parsed fields, a field that is
+not valid left out, and the HTTP/2 `CONNECT` stream (`src/conn/proxy/h2.rs`)
+its response's fields, in `TunnelError::ProxyAuthRequired`; the conversion
+to `ProxyFailure` moves them to the failure, whose `ProxyFailure::headers`
+(`src/conn/proxy/failure.rs`) gives them, `None` for every other failure.
+The status line's reason phrase and version are not kept. Nothing else
+changes.
+
+## request-connect-fields
+
+A tunnel's `CONNECT` fields came only from the proxy's configuration
+(`Proxy::basic_auth`, `Proxy::custom_http_headers`), so a client answering
+a proxy's challenge to one request's `CONNECT` (RFC 9110 sections 9.3.6 and
+11.7.2) needed a second client or a per-request proxy. With the patch,
+`RequestBuilder::connect_headers(headers)` (`src/client/request.rs`) keeps
+the fields with the request (`ConnectFields`, `src/client/layer/config.rs`);
+`HttpClient` (`src/client/layer/client.rs`) gives them to the connection's
+descriptor (`src/conn/descriptor.rs`), which adds them to the connection's
+group (`src/group.rs`), hashed by name in sorted order and then each name's
+values in order, as `HeaderMap`'s equality compares them, so a tunnel
+opened with them serves only requests with the same fields. The connector
+(`src/conn/connector.rs`) merges them over the proxy's own fields on the
+HTTP/1.1 `CONNECT`, and `proxy::h2::open` on the HTTP/2 `CONNECT` stream,
+each replacing the proxy's fields of their names. A forwarded request, a
+SOCKS proxy, a Unix socket and a direct connection do not send them, and a
+preconnect sets none. Without the call nothing changes.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -325,3 +360,4 @@ as before.
 | NET-CERT-SEAM-1 | the last commit of this range | the patch `async-verify-evidence` |
 | WREQ-PRECONNECT-1 | the last commit of this range | the patch `pool-preconnect` |
 | NET-WREQ-FORK-2 | the last commit of this range | the patches `version-fields`, `grouped-preconnect` and `connector-layer-identity` |
+| CDP-FETCH-TUNNEL-AUTH-1 | the last commit of this range | the patches `connect-challenge-fields` and `request-connect-fields` |
