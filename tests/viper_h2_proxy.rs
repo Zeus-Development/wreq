@@ -559,3 +559,182 @@ async fn a_connector_layer_reads_whether_http2_was_negotiated() {
     seen.extend(plain.0.lock().unwrap().iter().copied());
     assert_eq!(seen, [true, false, false]);
 }
+
+// VIPER-PATCH(ws-tunnel), the follow-up of WREQ-FORK-3's review: a forced
+// tunnel to an `http` destination through an HTTPS proxy that negotiates
+// HTTP/2 is a `CONNECT` stream too, with no TLS inside it, and carries the
+// request in origin form, as a `ws:` handshake goes.
+#[tokio::test]
+async fn a_forced_tunnel_to_an_http_destination_is_an_http2_connect_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&heads);
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(stream.read_u8().await.unwrap());
+        }
+        seen.lock().unwrap().push(String::from_utf8(head).unwrap());
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        stream.write_all(answer).await.unwrap();
+    });
+    let proxy = proxy(H2_AND_HTTP1, None).await;
+    let client = client(&proxy, Some(BOTH));
+    let url = format!("http://127.0.0.1:{port}/chat");
+    let response = client.get(url).force_tunnel(true).send().await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(*proxy.offers.lock().unwrap(), [H2_AND_HTTP1.to_vec()]);
+    assert_eq!(proxy.connects.lock().unwrap().len(), 1, "one CONNECT stream");
+    let heads = heads.lock().unwrap();
+    assert!(heads[0].starts_with("GET /chat HTTP/1.1\r\n"), "{heads:?}");
+}
+
+// VIPER-PATCH(connect-superseded): a connector layer gives up an attempt
+// once another with the same pool key negotiated HTTP/2, and the request
+// takes that connection from the pool instead of failing.
+#[derive(Clone)]
+struct Superseding {
+    /// Each attempt's pool key, in the order the layer was called.
+    keys: Arc<Mutex<Vec<wreq::PoolKey>>>,
+    /// The connections the layer let the transport make.
+    made: Arc<AtomicUsize>,
+    /// Set once the first attempt negotiated HTTP/2.
+    won: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Set once the second attempt started.
+    second: Arc<tokio::sync::Notify>,
+    /// Whether the first attempt is given up at once, with nothing won.
+    give_up_first: bool,
+}
+
+impl Superseding {
+    fn new(give_up_first: bool) -> Self {
+        Superseding {
+            keys: Arc::default(),
+            made: Arc::default(),
+            won: Arc::new(tokio::sync::watch::Sender::new(false)),
+            second: Arc::default(),
+            give_up_first,
+        }
+    }
+
+    fn keys(&self) -> Vec<wreq::PoolKey> {
+        self.keys.lock().unwrap().clone()
+    }
+}
+
+impl<S> tower::Layer<S> for Superseding {
+    type Service = SupersedingService<S>;
+    fn layer(&self, inner: S) -> SupersedingService<S> {
+        SupersedingService(inner, self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct SupersedingService<S>(S, Superseding);
+
+impl<S> tower::Service<wreq::Unnameable> for SupersedingService<S>
+where
+    S: tower::Service<wreq::Unnameable, Response = wreq::Conn, Error = tower::BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = wreq::Conn;
+    type Error = tower::BoxError;
+    type Future = Connecting;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tower::BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: wreq::Unnameable) -> Connecting {
+        let script = self.1.clone();
+        let index = {
+            let mut keys = script.keys.lock().unwrap();
+            keys.push(target.pool_key());
+            keys.len() - 1
+        };
+        if index == 0 && script.give_up_first {
+            return Box::pin(async { Err(wreq::Superseded.into()) });
+        }
+        if index == 1 && !script.give_up_first {
+            script.second.notify_one();
+            let mut won = script.won.subscribe();
+            return Box::pin(async move {
+                won.wait_for(|won| *won).await.unwrap();
+                Err(wreq::Superseded.into())
+            });
+        }
+        let connecting = self.0.call(target);
+        Box::pin(async move {
+            if index == 0 {
+                script.second.notified().await;
+            }
+            let conn = connecting.await?;
+            script.made.fetch_add(1, Ordering::SeqCst);
+            if conn.negotiated_h2() {
+                script.won.send_replace(true);
+            }
+            Ok(conn)
+        })
+    }
+}
+
+fn superseding_client(layer: &Superseding) -> Client {
+    Client::builder()
+        .no_proxy()
+        .connector_layer(layer.clone())
+        .tls_cert_verification(false)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_superseded_attempts_request_takes_the_connection_that_won() {
+    let origin = origin_selecting(H2_AND_HTTP1).await;
+    let layer = Superseding::new(false);
+    let client = superseding_client(&layer);
+    let url = format!("https://127.0.0.1:{origin}/");
+    let (first, second) = tokio::join!(client.get(&url).send(), client.get(&url).send());
+    for response in [first.unwrap(), second.unwrap()] {
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+    assert_eq!(layer.made.load(Ordering::SeqCst), 1, "one connection");
+    // A request pooled apart (over HTTP/1.1 only) has another key.
+    let other = client.get(&url).version(http::Version::HTTP_11);
+    assert_eq!(other.send().await.unwrap().text().await.unwrap(), "ok");
+    let keys = layer.keys();
+    assert_eq!(keys.len(), 3, "{keys:?}");
+    assert_eq!(keys[0], keys[1]);
+    assert_ne!(keys[0], keys[2]);
+}
+
+#[tokio::test]
+async fn a_superseded_preconnect_takes_the_connection_that_won() {
+    let origin = origin_selecting(H2_AND_HTTP1).await;
+    let layer = Superseding::new(false);
+    let client = superseding_client(&layer);
+    let uri = format!("https://127.0.0.1:{origin}/").parse().unwrap();
+    let outcomes = client.preconnect(uri, 2, None).await;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(layer.made.load(Ordering::SeqCst), 1, "one connection");
+    assert_eq!(layer.keys().len(), 2);
+}
+
+#[tokio::test]
+async fn a_superseded_attempt_with_nothing_won_starts_again() {
+    let origin = origin_selecting(H2_AND_HTTP1).await;
+    let layer = Superseding::new(true);
+    let client = superseding_client(&layer);
+    let response = client.get(format!("https://127.0.0.1:{origin}/")).send();
+    assert_eq!(response.await.unwrap().text().await.unwrap(), "ok");
+    assert_eq!(layer.made.load(Ordering::SeqCst), 1);
+    let keys = layer.keys();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_eq!(keys[0], keys[1]);
+}

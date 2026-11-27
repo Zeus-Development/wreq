@@ -330,6 +330,8 @@ pub use self::conn::proxy::failure::{ProxyFailure, ProxyFailureKind};
 // VIPER-PATCH(connector-layer-identity): the types a connector layer's
 // service takes and gives, named so that a layer can read them.
 pub use self::conn::{Conn, Unnameable};
+// VIPER-PATCH(connect-superseded): a layer's pool key and its give-up error.
+pub use self::conn::{PoolKey, Superseded};
 pub use self::{
     client::{
         Client, ClientBuilder,

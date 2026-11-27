@@ -137,6 +137,36 @@ impl Conn {
     }
 }
 
+// VIPER-PATCH(connect-superseded): a connector layer racing attempts to
+// one destination keys them by the pool key they would be pooled under, and
+// marks one it gives up as superseded, so its request waits for the
+// connection that won instead of failing.
+/// The key a connection is pooled under: two attempts with equal keys
+/// make interchangeable connections. Opaque; only compared and hashed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PoolKey(descriptor::ConnectionId);
+
+impl Unnameable {
+    /// The key the connection being made will be pooled under.
+    pub fn pool_key(&self) -> PoolKey {
+        PoolKey(self.0.id())
+    }
+}
+
+/// A connector layer's error for an attempt it gave up because another
+/// attempt with the same [`PoolKey`] negotiated HTTP/2: the request then
+/// takes that connection from the pool rather than failing.
+#[derive(Debug)]
+pub struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("another connection to the destination negotiated HTTP/2")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
 pin_project! {
     /// A wrapper around `SslStream` that adapts it for use as a generic async connection.
     ///

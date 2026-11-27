@@ -181,6 +181,29 @@ impl<T: Poolable, K: Key> Pool<T, K> {
         })
     }
 
+    // VIPER-PATCH(connect-superseded): a request whose attempt a connector
+    // layer gave up waits only where a connection is sure to come or to
+    // fail it: the HTTP/2 connection being made (its lock's release wakes
+    // the waiter either way) or an idle one.
+    /// A checkout for `key` after its request's attempt was superseded:
+    /// waiting for the HTTP/2 connection being made, or taking an idle
+    /// one; `None` when neither exists.
+    pub fn superseded(&self, key: K) -> Option<Checkout<T, K>> {
+        let mut inner = self.inner.as_ref()?.lock();
+        let waiter = if inner.idle.contains(&key) {
+            None
+        } else if inner.connecting.contains(&key) {
+            let (tx, rx) = oneshot::channel();
+            inner.waiters.entry(key.clone()).or_default().push_back(tx);
+            Some(rx)
+        } else {
+            return None;
+        };
+        drop(inner);
+        let pool = self.clone();
+        Some(Checkout { key, pool, waiter })
+    }
+
     pub fn pooled(&self, mut connecting: Connecting<T, K>, value: T) -> Pooled<T, K> {
         let (value, pool_ref) = if let Some(ref enabled) = self.inner {
             match value.reserve() {

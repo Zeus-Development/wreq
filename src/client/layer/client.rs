@@ -484,6 +484,8 @@ where
         // below, which may give it that one or the pooled one (reused).
         if self.config.new_connection {
             match self.connect_to(descriptor.clone()).await {
+                // VIPER-PATCH(connect-superseded): the connection that won.
+                Err(err) if err.is_superseded() => return self.superseded(descriptor.id()).await,
                 Err(err) if err.is_canceled() => {}
                 connected => return connected.map_err(ClientConnectError::Normal),
             }
@@ -499,7 +501,8 @@ where
         // - If a new connection is started, but the Checkout wins after (an idle connection became
         //   available first), the started connection future is spawned into the runtime to
         //   complete, and then be inserted into the pool as an idle connection.
-        let checkout = self.pool.checkout(descriptor.id());
+        let id = descriptor.id(); // VIPER-PATCH(connect-superseded)
+        let checkout = self.pool.checkout(id.clone());
         let connect = self.connect_to(descriptor);
         let is_ver_h2 = self.config.ver == Ver::Http2;
 
@@ -552,6 +555,13 @@ where
                     )))
                 }
             }
+            // VIPER-PATCH(connect-superseded): a superseded attempt's request
+            // waits for the connection that won, and starts again if there
+            // is none or it fails.
+            Either::Right((Err(err), checkout)) if err.is_superseded() => {
+                drop(checkout);
+                self.superseded(id).await
+            }
             Either::Right((Err(err), checkout)) => {
                 if err.is_canceled() {
                     checkout.await.map_err(move |err| {
@@ -565,6 +575,19 @@ where
                     Err(ClientConnectError::Normal(err))
                 }
             }
+        }
+    }
+
+    // VIPER-PATCH(connect-superseded): the checkout of a request whose
+    // attempt a connector layer gave up, or a fresh start.
+    async fn superseded(
+        &self,
+        id: ConnectionId,
+    ) -> Result<pool::Pooled<PoolClient<B>, ConnectionId>, ClientConnectError> {
+        let closed = ClientConnectError::CheckoutIsClosed;
+        match self.pool.superseded(id) {
+            Some(checkout) => checkout.await.map_err(closed),
+            None => Err(closed(pool::Error::CheckoutNoLongerWanted)),
         }
     }
 
@@ -1094,6 +1117,12 @@ impl Error {
         } else {
             kind
         };
+        // VIPER-PATCH(connect-superseded): a connector layer gave it up.
+        let kind = if error.is::<crate::Superseded>() {
+            ErrorKind::Canceled
+        } else {
+            kind
+        };
 
         Self {
             kind,
@@ -1143,6 +1172,11 @@ impl Error {
     #[inline]
     fn is_canceled(&self) -> bool {
         matches!(self.kind, ErrorKind::Canceled)
+    }
+
+    // VIPER-PATCH(connect-superseded): a connector layer's [`Superseded`].
+    fn is_superseded(&self) -> bool {
+        self.is_canceled() && self.source.as_ref().is_some_and(|e| e.is::<crate::Superseded>())
     }
 
     #[inline]
