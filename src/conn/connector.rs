@@ -321,12 +321,14 @@ impl TransportConnector {
                 tls_info: false,
                 proxy: None,
                 guard: None, // VIPER-PATCH(connector-layer-identity)
+                on_h2_lock: None, // VIPER-PATCH(h2-lock-notice)
             },
             MaybeHttpsStream::Https(stream) => Conn {
                 stream: self.config.verbose.wrap(TlsConn { stream }),
                 tls_info: self.config.tls_info,
                 proxy: None,
                 guard: None, // VIPER-PATCH(connector-layer-identity)
+                on_h2_lock: None, // VIPER-PATCH(h2-lock-notice)
             },
         };
 
@@ -350,6 +352,7 @@ impl TransportConnector {
             tls_info: self.config.tls_info,
             proxy: proxy.into(),
             guard: None, // VIPER-PATCH(connector-layer-identity)
+            on_h2_lock: None, // VIPER-PATCH(h2-lock-notice)
         })
     }
 

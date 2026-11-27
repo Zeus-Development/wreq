@@ -650,6 +650,11 @@ where
                         };
 
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
+                        // VIPER-PATCH(h2-lock-notice): the lock is the connection's.
+                        let mut io = io;
+                        if is_h2 {
+                            io.h2_locked();
+                        }
 
                         Either::Left(Box::pin(async move {
                             let tx = if is_h2 {

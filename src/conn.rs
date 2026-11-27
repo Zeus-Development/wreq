@@ -87,6 +87,9 @@ pin_project! {
         // VIPER-PATCH(connector-layer-identity): a connector layer's value,
         // dropped with the connection.
         guard: Option<Box<dyn std::any::Any + Send + Sync>>,
+        // VIPER-PATCH(h2-lock-notice): a connector layer's notice, called
+        // once the pool's HTTP/2 lock of the connection's key is its.
+        on_h2_lock: Option<Box<dyn FnOnce() + Send + Sync>>,
     }
 }
 
@@ -106,6 +109,22 @@ impl Conn {
     /// when the pool drops it. A second guard replaces the first.
     pub fn with_guard(mut self, guard: Box<dyn std::any::Any + Send + Sync>) -> Conn {
         self.guard = Some(guard);
+        self
+    }
+}
+
+// VIPER-PATCH(h2-lock-notice): a connector layer racing attempts to one
+// destination learns when the connection it made became the one the pool
+// makes its key's HTTP/2 connection on, so that an attempt starting before
+// then can be given up too.
+impl Conn {
+    /// Calls `notice` once the pool holds its key's HTTP/2 lock for the
+    /// connection, right before the HTTP/2 handshake: after ALPN chose `h2`
+    /// (RFC 7301) and no other connection of the key held the lock, or at
+    /// once for an HTTP/2-only client. Never for HTTP/1. A second notice
+    /// replaces the first.
+    pub fn on_h2_lock(mut self, notice: impl FnOnce() + Send + Sync + 'static) -> Conn {
+        self.on_h2_lock = Some(Box::new(notice));
         self
     }
 }
@@ -183,6 +202,11 @@ pin_project! {
 pub trait Connection {
     /// Return metadata describing the connection.
     fn connected(&self) -> Connected;
+
+    // VIPER-PATCH(h2-lock-notice): the pool's HTTP/2 lock taken for it.
+    /// Called once the pool holds its key's HTTP/2 lock for the connection,
+    /// before its HTTP/2 handshake; nothing by default.
+    fn h2_locked(&mut self) {}
 }
 
 /// Indicates the negotiated ALPN protocol.
@@ -240,6 +264,13 @@ pub struct Connected {
 // ==== impl Conn ====
 
 impl Connection for Conn {
+    // VIPER-PATCH(h2-lock-notice): the layer's notice, once.
+    fn h2_locked(&mut self) {
+        if let Some(notice) = self.on_h2_lock.take() {
+            notice();
+        }
+    }
+
     fn connected(&self) -> Connected {
         let mut connected = self.stream.connected();
 

@@ -739,6 +739,72 @@ async fn a_superseded_attempt_with_nothing_won_starts_again() {
     assert_eq!(keys[0], keys[1]);
 }
 
+// VIPER-PATCH(h2-lock-notice): a connector layer's notice on the connection
+// it made, called once the pool's HTTP/2 lock of its key is the
+// connection's, after the layer returned; never for HTTP/1.1.
+#[derive(Clone, Default)]
+struct Noticing(Arc<Mutex<Vec<&'static str>>>);
+
+impl<S> tower::Layer<S> for Noticing {
+    type Service = NoticingService<S>;
+    fn layer(&self, inner: S) -> NoticingService<S> {
+        NoticingService(inner, self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct NoticingService<S>(S, Noticing);
+
+impl<S> tower::Service<wreq::Unnameable> for NoticingService<S>
+where
+    S: tower::Service<wreq::Unnameable, Response = wreq::Conn, Error = tower::BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = wreq::Conn;
+    type Error = tower::BoxError;
+    type Future = Connecting;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tower::BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: wreq::Unnameable) -> Connecting {
+        let (connecting, log) = (self.0.call(target), self.1.0.clone());
+        Box::pin(async move {
+            let notice = Arc::clone(&log);
+            let conn = connecting.await?;
+            let conn = conn.on_h2_lock(move || notice.lock().unwrap().push("locked"));
+            log.lock().unwrap().push("returned");
+            Ok(conn)
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_layers_notice_comes_once_the_http2_lock_is_the_connections() {
+    let mut logs = Vec::new();
+    for select in [H2_AND_HTTP1, HTTP1_ONLY] {
+        let origin = origin_selecting(select).await;
+        let noticing = Noticing::default();
+        let client = Client::builder()
+            .no_proxy()
+            .connector_layer(noticing.clone())
+            .tls_cert_verification(false)
+            .build()
+            .unwrap();
+        let url = format!("https://127.0.0.1:{origin}/");
+        for _ in 0..2 {
+            let response = client.get(&url).send().await.unwrap();
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+        logs.push(noticing.0.lock().unwrap().clone());
+    }
+    assert_eq!(logs, [vec!["returned", "locked"], vec!["returned"]]);
+}
+
 // VIPER-PATCH(h2-proxy-profile): a proxy that records the client's frames up
 // to its first HEADERS (type, flags, stream, payload), then closes.
 type Frames = Vec<(u8, u8, u32, Vec<u8>)>;
