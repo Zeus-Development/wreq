@@ -190,7 +190,12 @@ impl<T: Poolable, K: Key> Pool<T, K> {
     /// one; `None` when neither exists.
     pub fn superseded(&self, key: K) -> Option<Checkout<T, K>> {
         let mut inner = self.inner.as_ref()?.lock();
-        let waiter = if inner.idle.contains(&key) {
+        // VIPER-PATCH(connect-superseded): only an open, unexpired idle
+        // entry counts, as `IdlePopper` takes one; a closed or expired one
+        // would leave the checkout waiting where no connection comes.
+        let (expiration, now) = (Expiration::new(inner.timeout), inner.now());
+        let usable = |e: &Idle<T>| e.value.is_open() && !expiration.expires(e.idle_at, now);
+        let waiter = if inner.idle.peek(&key).is_some_and(|list| list.iter().any(usable)) {
             None
         } else if inner.connecting.contains(&key) {
             let (tx, rx) = oneshot::channel();
@@ -1129,5 +1134,33 @@ mod tests {
         assert!(pool.locked().idle.get(&key1).is_none());
         assert!(pool.locked().idle.get(&key2).is_some());
         assert!(pool.locked().idle.get(&key3).is_some());
+    }
+
+    // VIPER-PATCH(connect-superseded): closed and expired idle entries serve
+    // no superseded request, so with no HTTP/2 connection being made it
+    // connects again at once; an open one still serves it.
+    #[test]
+    fn superseded_counts_only_open_unexpired_idle_entries() {
+        use futures_util::FutureExt;
+
+        let pool = pool_no_timer::<CanClose, KeyImpl>();
+        let key = host_key("foo");
+        let (timeout, now) = (pool.locked().timeout.unwrap(), pool.locked().now());
+        let stale = now.checked_sub(timeout * 2).unwrap();
+        let entry = |closed, idle_at| super::Idle {
+            idle_at,
+            value: CanClose { val: 7, closed },
+        };
+        let mut inner = pool.locked();
+        let idle = inner.idle.get_or_insert_mut(key.clone(), Vec::new);
+        idle.extend([entry(true, now), entry(false, stale)]);
+        drop(inner);
+        assert!(pool.superseded(key.clone()).is_none(), "connects at once");
+        assert!(!pool.locked().waiters.contains_key(&key), "no waiter left");
+
+        pool.locked().idle.peek_mut(&key).unwrap().push(entry(false, now));
+        let checkout = pool.superseded(key).expect("the open entry");
+        let pooled = checkout.now_or_never().expect("ready").expect("checked out");
+        assert!(pooled.is_open());
     }
 }
