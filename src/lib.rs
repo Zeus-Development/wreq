@@ -327,6 +327,9 @@ pub use self::client::multipart;
 pub use self::client::ws;
 // VIPER-PATCH(typed-proxy-errors): a failed connection through a proxy.
 pub use self::conn::proxy::failure::{ProxyFailure, ProxyFailureKind};
+// VIPER-PATCH(connector-layer-identity): the types a connector layer's
+// service takes and gives, named so that a layer can read them.
+pub use self::conn::{Conn, Unnameable};
 pub use self::{
     client::{
         Client, ClientBuilder,

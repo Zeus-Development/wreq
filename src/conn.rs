@@ -48,7 +48,8 @@ pub type BoxedTransportConnector = BoxCloneSyncService<Unnameable, Conn, BoxErro
 pub type BoxedConnectorLayer =
     BoxCloneSyncServiceLayer<BoxedTransportConnector, Unnameable, Conn, BoxError>;
 
-/// A wrapper type for [`descriptor::ConnectionDescriptor`] used to erase its concrete type.
+/// A wrapper type for the crate's `ConnectionDescriptor` used to erase its concrete type
+/// (VIPER-PATCH(connector-layer-identity): named outside the crate, so not a doc link).
 ///
 /// [`Unnameable`] allows passing connection requests through trait objects or
 /// type-erased interfaces where the concrete type of the request is not important.
@@ -83,6 +84,29 @@ pin_project! {
         proxy: Option<Intercept>,
         #[pin]
         stream: Box<dyn AsyncConnWithInfo>,
+        // VIPER-PATCH(connector-layer-identity): a connector layer's value,
+        // dropped with the connection.
+        guard: Option<Box<dyn std::any::Any + Send + Sync>>,
+    }
+}
+
+// VIPER-PATCH(connector-layer-identity): a connector layer (wreq's
+// `ClientBuilder::connector_layer`) can see what each connection is made for
+// and keep a value as long as the connection lives, to count connections.
+impl Unnameable {
+    /// The URI the connection is made for: the origin's scheme, host and
+    /// port, with the path `/`.
+    pub fn uri(&self) -> &::http::Uri {
+        self.0.uri()
+    }
+}
+
+impl Conn {
+    /// Keeps `guard` until the connection is dropped: when it closes, or
+    /// when the pool drops it. A second guard replaces the first.
+    pub fn with_guard(mut self, guard: Box<dyn std::any::Any + Send + Sync>) -> Conn {
+        self.guard = Some(guard);
+        self
     }
 }
 
