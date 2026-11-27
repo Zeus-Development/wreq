@@ -54,14 +54,12 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Each question a hook was asked: the peer and the try number.
+type Asked = Arc<Mutex<Vec<(SocketAddr, u32)>>>;
+
 /// A hook answering `ports` in order, one per try, recording each question.
-fn hook(
-    ports: Vec<u16>,
-) -> (
-    impl Fn(SocketAddr, u32) -> Option<u16> + Send + Sync + 'static,
-    Arc<Mutex<Vec<(SocketAddr, u32)>>>,
-) {
-    let asked = Arc::new(Mutex::new(Vec::new()));
+fn hook(ports: Vec<u16>) -> (impl Fn(SocketAddr, u32) -> Option<u16> + Send + Sync, Asked) {
+    let asked = Asked::default();
     let record = Arc::clone(&asked);
     let choose = move |peer: SocketAddr, attempt: u32| {
         record.lock().unwrap().push((peer, attempt));
@@ -128,9 +126,12 @@ async fn with_no_port_left_the_os_picks_one() {
     drop(busy);
 }
 
+/// A connection's local and peer addresses, if any.
+type Pair = Option<(SocketAddr, SocketAddr)>;
+
 /// The addresses a connector layer read.
 #[derive(Clone, Default)]
-struct Addresses(Arc<Mutex<Vec<Option<(SocketAddr, SocketAddr)>>>>);
+struct Addresses(Arc<Mutex<Vec<Pair>>>);
 
 #[derive(Clone)]
 struct Reading<S>(S, Addresses);
