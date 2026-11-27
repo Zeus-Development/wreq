@@ -451,3 +451,111 @@ async fn a_preconnect_with_connect_fields_serves_the_request_with_them() {
     }
 }
 
+// VIPER-PATCH(negotiated-alpn): a connector layer reads whether each
+// connection it made negotiated HTTP/2.
+#[derive(Clone, Default)]
+struct Negotiated(Arc<Mutex<Vec<bool>>>);
+
+impl<S> tower::Layer<S> for Negotiated {
+    type Service = NegotiatedService<S>;
+    fn layer(&self, inner: S) -> NegotiatedService<S> {
+        NegotiatedService(inner, self.clone())
+    }
+}
+
+#[derive(Clone)]
+struct NegotiatedService<S>(S, Negotiated);
+
+type Connecting =
+    Pin<Box<dyn std::future::Future<Output = Result<wreq::Conn, tower::BoxError>> + Send>>;
+
+impl<S> tower::Service<wreq::Unnameable> for NegotiatedService<S>
+where
+    S: tower::Service<wreq::Unnameable, Response = wreq::Conn, Error = tower::BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = wreq::Conn;
+    type Error = tower::BoxError;
+    type Future = Connecting;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tower::BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, target: wreq::Unnameable) -> Connecting {
+        let (connecting, seen) = (self.0.call(target), self.1.clone());
+        Box::pin(async move {
+            let conn = connecting.await?;
+            seen.0.lock().unwrap().push(conn.negotiated_h2());
+            Ok(conn)
+        })
+    }
+}
+
+/// A TLS origin selecting from `select` and serving HTTP/2 or HTTP/1.1.
+async fn origin_selecting(select: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let context = context(select, Arc::default());
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tls = accept_tls(&context, stream).await;
+            let h2 = tls.ssl().selected_alpn_protocol() == Some(b"h2".as_slice());
+            let answer = service_fn(|_: Request<Incoming>| async {
+                Ok::<_, io::Error>(Response::new(Full::new(Bytes::from("ok"))))
+            });
+            let io = TokioIo::new(tls);
+            if h2 {
+                let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+                tokio::spawn(conn.serve_connection(io, answer));
+            } else {
+                tokio::spawn(
+                    hyper::server::conn::http1::Builder::new().serve_connection(io, answer),
+                );
+            }
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn a_connector_layer_reads_whether_http2_was_negotiated() {
+    let mut seen = Vec::new();
+    for select in [H2_AND_HTTP1, HTTP1_ONLY] {
+        let origin = origin_selecting(select).await;
+        let negotiated = Negotiated::default();
+        let client = Client::builder()
+            .no_proxy()
+            .connector_layer(negotiated.clone())
+            .tls_cert_verification(false)
+            .build()
+            .unwrap();
+        let body = client
+            .get(format!("https://127.0.0.1:{origin}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(body.text().await.unwrap(), "ok");
+        seen.extend(negotiated.0.lock().unwrap().iter().copied());
+    }
+    // A plain-text connection negotiated nothing.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { drop(listener.accept().await) });
+    let plain = Negotiated::default();
+    let client = Client::builder()
+        .no_proxy()
+        .connector_layer(plain.clone())
+        .build()
+        .unwrap();
+    client
+        .get(format!("http://127.0.0.1:{port}/"))
+        .send()
+        .await
+        .unwrap_err();
+    seen.extend(plain.0.lock().unwrap().iter().copied());
+    assert_eq!(seen, [true, false, false]);
+}

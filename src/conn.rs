@@ -110,6 +110,18 @@ impl Conn {
     }
 }
 
+// VIPER-PATCH(negotiated-alpn): a connector layer that races several
+// connections to one origin can tell, once one is made, whether it
+// negotiated HTTP/2 (ALPN, RFC 7301), which a client shares, and so give up
+// the others still connecting.
+impl Conn {
+    /// Whether the connection negotiated HTTP/2 through ALPN: false for
+    /// HTTP/1.1, no ALPN, or a plain-text connection.
+    pub fn negotiated_h2(&self) -> bool {
+        self.stream.connected().is_negotiated_h2()
+    }
+}
+
 pin_project! {
     /// A wrapper around `SslStream` that adapts it for use as a generic async connection.
     ///
