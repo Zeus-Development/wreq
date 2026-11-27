@@ -17,6 +17,42 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) struct DefaultHeaders;
 
+// VIPER-PATCH(version-fields): a request's fields that stay on its head
+// only when the connection it is checked out on speaks one of `versions`;
+// the version is the connection's, known only after checkout (an ALPN offer
+// of several protocols is decided by the server, RFC 7301 section 3.2).
+/// Fields of a request kept after checkout on a connection of the listed
+/// versions only.
+#[derive(Debug, Clone)]
+pub(crate) struct VersionFields {
+    pub versions: Vec<Version>,
+    pub headers: HeaderMap,
+}
+
+impl VersionFields {
+    /// Fits `headers` to a connection of `version`: on a listed version the
+    /// fields stay, or come back at the end after a retry took them out; on
+    /// another their names are taken out, the other fields keeping their
+    /// order.
+    pub(crate) fn apply(&self, headers: &mut HeaderMap, version: Version) {
+        if self.versions.contains(&version) {
+            for (name, value) in &self.headers {
+                if !headers.contains_key(name) {
+                    headers.append(name, value.clone());
+                }
+            }
+        } else if self.headers.keys().any(|name| headers.contains_key(name)) {
+            let mut current = None;
+            for (name, value) in std::mem::take(headers) {
+                current = name.or(current);
+                if let Some(name) = current.as_ref().filter(|n| !self.headers.contains_key(*n)) {
+                    headers.append(name.clone(), value);
+                }
+            }
+        }
+    }
+}
+
 /// Per-request configuration for proxy, protocol, and transport options.
 /// Overrides client defaults for a single request.
 #[derive(Debug, Default, Clone)]

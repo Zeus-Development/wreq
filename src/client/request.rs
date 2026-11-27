@@ -25,7 +25,7 @@ use super::{
     Body, Client, IntoEmulation, Response,
     future::Pending,
     layer::{
-        config::{DefaultHeaders, RequestOptions},
+        config::{DefaultHeaders, RequestOptions, VersionFields},
         timeout::TimeoutOptions,
     },
 };
@@ -807,6 +807,23 @@ impl RequestBuilder {
             req.config_mut::<RequestOptions>()
                 .get_or_insert_default()
                 .new_connection = new_connection;
+        }
+        self
+    }
+
+    // VIPER-PATCH(version-fields): RFC 9218's Priority field, for one, may
+    // be meant for some HTTP versions only, while the version of a pooled
+    // connection is known only after checkout (RFC 7301 section 3.2).
+    /// Adds `headers` as [`headers`](Self::headers) does, and keeps them only
+    /// when the connection the request is sent on speaks one of `versions`
+    /// (`HTTP_11` for an HTTP/1 connection, `HTTP_2`): on another, once that
+    /// connection is known, the fields of their names are taken out and the
+    /// others keep their order. Without it, nothing changes.
+    pub fn version_fields(mut self, versions: &[Version], headers: HeaderMap) -> RequestBuilder {
+        if let Ok(ref mut req) = self.request {
+            crate::util::replace_headers(req.headers_mut(), headers.clone());
+            let versions = versions.to_vec();
+            (req.extensions_mut()).insert(VersionFields { versions, headers });
         }
         self
     }

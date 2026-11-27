@@ -39,7 +39,7 @@ use {
 
 use self::lazy::{Started as Lazy, lazy};
 use crate::{
-    client::layer::config::RequestOptions,
+    client::layer::config::{RequestOptions, VersionFields},
     config::RequestConfig,
     conn::{
         Connected, Connection,
@@ -319,6 +319,18 @@ where
             }
         } else if req.method() == Method::CONNECT && !pooled.is_http2() {
             authority_form(req.uri_mut());
+        }
+
+        // VIPER-PATCH(version-fields): the connection's version is known
+        // now; fields meant for some versions only stay on a listed one's.
+        if let Some(fields) = req.extensions_mut().remove::<VersionFields>() {
+            let version = if pooled.is_http2() {
+                Version::HTTP_2
+            } else {
+                Version::HTTP_11
+            };
+            fields.apply(req.headers_mut(), version);
+            req.extensions_mut().insert(fields);
         }
 
         #[cfg(feature = "cookies")]
