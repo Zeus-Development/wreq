@@ -74,6 +74,7 @@ entry takes `wreq-proto` from the branch `viper/wreq-proto-0.2.6`.
 | `connector-layer-identity` | a connector layer can read the origin each connection is made for (`Unnameable::uri`) and give the connection a value it holds until it is dropped (`Conn::with_guard`); `Conn` and `Unnameable` are exported so a layer can name them | none | fork: `tests/viper_connector_layer.rs`; Viper: `viper-net::preconnect a_connector_layer_reads_the_origin_and_its_guard_drops_with_the_connection` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `connect-challenge-fields` | an HTTP proxy's 407 answer to `CONNECT`, over HTTP/1.1 or as an HTTP/2 stream, keeps its fields on the failure (`ProxyFailure::headers`), its `Proxy-Authenticate` challenges among them, so a caller can answer them (RFC 9110 sections 15.5.8 and 11.7.1) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_connect_challenge.rs`, `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_tunnels_407_pauses_and_its_answer_goes_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 | `request-connect-fields` | a request may set the fields of the `CONNECT` that opens its own tunnel (`RequestBuilder::connect_headers`), in place of the proxy's of their names, its tunnel keyed apart in the pool, so a caller answers a proxy's challenge on that request's tunnel only (RFC 9110 sections 9.3.6 and 11.7.2) | `cdp:fetch-proxy-auth-tunnel` | fork: `tests/viper_h2_proxy.rs`; Viper: `viper-net::intercept_proxy a_routes_refused_credentials_give_way_to_the_answer_on_the_connect` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
+| `connect-head-fields` | a request may set the order and case of the fields of its tunnel's `CONNECT` head (`RequestBuilder::connect_order`), `Host` among them, part of its tunnel's key, so a client writes that head as a browser does; over HTTP/2 the order holds and names stay lower case (RFC 9113 section 8.2.1) | none | fork: `tests/viper_connect_head.rs`, `tests/viper_h2_proxy.rs`; Viper: `viper-net::proxy_connect a_policys_connect_plan_is_written_in_its_order_and_case` | Apache-2.0 (Viper's own change) | candidate; never offered without the owner |
 
 ## typed-proxy-errors
 
@@ -331,6 +332,27 @@ each replacing the proxy's fields of their names. A forwarded request, a
 SOCKS proxy, a Unix socket and a direct connection do not send them, and a
 preconnect sets none. Without the call nothing changes.
 
+## connect-head-fields
+
+A tunnel's HTTP/1.1 `CONNECT` head always wrote `Host` right after the
+request line and every other field in lower case (`HeaderName::as_str`),
+in its map's order, so a client could not write the head a browser writes
+(Chrome: `Host`, `Proxy-Connection`, `User-Agent`). With the patch,
+`RequestBuilder::connect_order(order)` (`src/client/request.rs`) keeps an
+`OrigHeaderMap` with the request's `ConnectFields`
+(`src/client/layer/config.rs`), whose hash takes each spelling in order
+too, so a tunnel opened with one order serves only requests with the same.
+The connector (`src/conn/connector.rs`) gives it, through the descriptor
+(`src/conn/descriptor.rs`), to the HTTP/1.1 tunnel
+(`src/conn/proxy/tunnel.rs`), which writes `Host` and the head's fields
+(the proxy's credentials and custom headers, the request's own over them)
+through `OrigHeaderMap::call_visit`: the named fields first, in the order's
+order and spelling, then the others in lower case; `Host` goes where the
+order places it, or first when it does not name it, and only once. The
+HTTP/2 `CONNECT` stream (`src/conn/proxy/h2.rs`) sorts its fields by the
+same order, names in lower case (RFC 9113 section 8.2.1). Without the call
+nothing changes, byte for byte.
+
 ## Rebase procedure
 
 1. A new wreq release gets a new branch, `viper/wreq-<version>`, from the
@@ -361,3 +383,4 @@ preconnect sets none. Without the call nothing changes.
 | WREQ-PRECONNECT-1 | the last commit of this range | the patch `pool-preconnect` |
 | NET-WREQ-FORK-2 | the last commit of this range | the patches `version-fields`, `grouped-preconnect` and `connector-layer-identity` |
 | CDP-FETCH-TUNNEL-AUTH-1 | the last commit of this range | the patches `connect-challenge-fields` and `request-connect-fields` |
+| NET-CONNECT-FIELDS-1 | the last commit of this range | the patch `connect-head-fields` |
