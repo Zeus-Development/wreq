@@ -17,9 +17,13 @@ use std::{
 use btls::{
     error::ErrorStack,
     ex_data::Index,
-    ssl::{Ssl, SslConnector, SslMethod, SslOptions, SslSessionCacheMode},
+    ssl::{
+        ConnectConfiguration, Ssl, SslConnector, SslMethod, SslOptions, SslRef, SslSessionCacheMode,
+    },
 };
 use ext::SslConnectorBuilderExt;
+// VIPER-PATCH(trust-anchors): the raw SSL object for the library call.
+use foreign_types::ForeignTypeRef;
 use http::{Uri, Version};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_btls::SslStream;
@@ -35,6 +39,37 @@ use crate::{
         trust::{CertStore, Identity},
     },
 };
+
+// VIPER-PATCH(trust-anchors): `ids` in the wire format that
+// `SSL_set1_requested_trust_anchors` takes, a series of non-empty, 8-bit
+// length-prefixed IDs (draft-ietf-tls-trust-anchor-ids section 3).
+fn encode_trust_anchors(ids: &[Vec<u8>]) -> crate::Result<Vec<u8>> {
+    let mut wire = Vec::with_capacity(ids.iter().map(|id| id.len() + 1).sum());
+    for id in ids {
+        let len = u8::try_from(id.len())
+            .ok()
+            .filter(|len| *len != 0)
+            .ok_or_else(|| Error::builder("a trust anchor ID must be 1 to 255 bytes"))?;
+        wire.push(len);
+        wire.extend_from_slice(id);
+    }
+    Ok(wire)
+}
+
+// VIPER-PATCH(trust-anchors): sets `ids` (wire format) on `ssl`.
+#[allow(unsafe_code)]
+fn set_requested_trust_anchors(ssl: &mut SslRef, ids: &[u8]) -> Result<(), ErrorStack> {
+    // SAFETY: `ssl` is a live SSL object and `ids` is valid for `ids.len()`
+    // bytes; the library copies them before it returns.
+    let ok = unsafe {
+        btls_sys::SSL_set1_requested_trust_anchors(ssl.as_ptr(), ids.as_ptr(), ids.len())
+    };
+    if ok == 1 {
+        Ok(())
+    } else {
+        Err(ErrorStack::get())
+    }
+}
 
 fn key_index() -> Result<Index<Ssl, Key>, ErrorStack> {
     static IDX: LazyLock<Result<Index<Ssl, Key>, ErrorStack>> = LazyLock::new(Ssl::new_ex_index);
@@ -53,6 +88,8 @@ pub struct HandshakeSettings {
     alps_use_new_codepoint: bool,
     key_shares: Option<Cow<'static, [KeyShare]>>,
     random_aes_hw_override: bool,
+    // VIPER-PATCH(trust-anchors): the requested IDs in wire format.
+    trust_anchors: Option<Vec<u8>>,
 }
 
 /// A Connector using BoringSSL to support `http` and `https` schemes.
@@ -144,6 +181,10 @@ impl TlsConnector {
     fn setup_ssl(&self, uri: Uri) -> Result<Ssl, BoxError> {
         // VIPER-PATCH(proxy-alpn): the proxy's list, when one is set.
         let mut cfg = self.ssl.configure()?;
+        // VIPER-PATCH(proxy-hello-options): the proxy's hello carries the
+        // same per-connection options as an origin's, all but the origin's
+        // ALPN and session (each TLS connection is its own handshake).
+        self.hello_options(&mut cfg)?;
         if let Some(protocols) = &self.proxy_alpn {
             cfg.set_alpn_protos(protocols)?;
         }
@@ -153,9 +194,11 @@ impl TlsConnector {
         Ok(ssl)
     }
 
-    fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
-        let mut cfg = self.ssl.configure()?;
-
+    // VIPER-PATCH(proxy-hello-options): the per-connection options of every
+    // hello, an origin's or a proxy's (`setup_ssl`): SNI, hostname
+    // verification, ECH GREASE, the AES override, ALPS with its code point
+    // and the key shares.
+    fn hello_options(&self, cfg: &mut ConnectConfiguration) -> Result<(), BoxError> {
         // Use server name indication
         cfg.set_use_server_name_indication(self.settings.tls_sni);
 
@@ -170,6 +213,35 @@ impl TlsConnector {
             let random = (crate::util::fast_random() & 1) == 0;
             cfg.set_aes_hw_override(random);
         }
+
+        // Set ALPS protos
+        if let Some(ref alps_values) = self.settings.alps_protocols {
+            for alps in alps_values.iter() {
+                cfg.add_application_settings(alps.0)?;
+            }
+
+            // By default, the new endpoint is used.
+            if !alps_values.is_empty() {
+                cfg.set_alps_use_new_codepoint(self.settings.alps_use_new_codepoint);
+            }
+        }
+
+        // Set TLS key shares
+        if let Some(ref key_shares) = self.settings.key_shares {
+            cfg.set_client_key_shares(key_shares.as_ref())?;
+        }
+
+        // VIPER-PATCH(trust-anchors): the requested trust anchor IDs.
+        if let Some(ref ids) = self.settings.trust_anchors {
+            set_requested_trust_anchors(cfg, ids)?;
+        }
+        Ok(())
+    }
+
+    fn setup_ssl2(&self, descriptor: ConnectionDescriptor) -> Result<Ssl, BoxError> {
+        let mut cfg = self.ssl.configure()?;
+        // VIPER-PATCH(proxy-hello-options): shared with the proxy's hello.
+        self.hello_options(&mut cfg)?;
 
         // Set ALPN protocols
         if let Some(version) = descriptor.version() {
@@ -193,23 +265,6 @@ impl TlsConnector {
                 let encoded = AlpnProtocol::encode_sequence(alpn_values.as_ref());
                 cfg.set_alpn_protos(&encoded)?;
             }
-        }
-
-        // Set ALPS protos
-        if let Some(ref alps_values) = self.settings.alps_protocols {
-            for alps in alps_values.iter() {
-                cfg.add_application_settings(alps.0)?;
-            }
-
-            // By default, the new endpoint is used.
-            if !alps_values.is_empty() {
-                cfg.set_alps_use_new_codepoint(self.settings.alps_use_new_codepoint);
-            }
-        }
-
-        // Set TLS key shares
-        if let Some(ref key_shares) = self.settings.key_shares {
-            cfg.set_client_key_shares(key_shares.as_ref())?;
         }
 
         let uri = descriptor.uri().clone();
@@ -472,6 +527,12 @@ impl TlsConnectorBuilder {
             enable_ech_grease: opts.enable_ech_grease,
             key_shares: opts.key_shares.clone(),
             random_aes_hw_override: opts.random_aes_hw_override,
+            // VIPER-PATCH(trust-anchors): encoded once, refused here if invalid.
+            trust_anchors: opts
+                .trust_anchor_ids
+                .as_deref()
+                .map(encode_trust_anchors)
+                .transpose()?,
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.

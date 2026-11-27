@@ -291,6 +291,15 @@ pub struct TlsOptions {
     ///
     /// **Default:** `false`
     pub random_aes_hw_override: bool,
+
+    // VIPER-PATCH(trust-anchors): the trust anchor IDs a hello requests.
+    /// Requested trust anchor IDs (draft-ietf-tls-trust-anchor-ids), each
+    /// an opaque, non-empty ID of at most 255 bytes, sent in the
+    /// `trust_anchors` extension of every hello, an origin's or a proxy's.
+    /// An empty list sends the extension empty; `None` sends none.
+    ///
+    /// **Default:** `None`
+    pub trust_anchor_ids: Option<Cow<'static, [Vec<u8>]>>,
 }
 
 impl TlsOptionsBuilder {
@@ -443,6 +452,18 @@ impl TlsOptionsBuilder {
         self
     }
 
+    // VIPER-PATCH(trust-anchors): see `TlsOptions::trust_anchor_ids`.
+    /// Sets the trust anchor IDs every hello requests.
+    #[inline]
+    pub fn trust_anchor_ids<I, T>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<Vec<u8>>,
+    {
+        self.config.trust_anchor_ids = Some(ids.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Sets the supported curves list.
     #[inline]
     pub fn curves_list<T>(mut self, curves: T) -> Self
@@ -576,6 +597,8 @@ impl Default for TlsOptions {
             aes_hw_override: None,
             preserve_tls13_cipher_list: None,
             random_aes_hw_override: false,
+            // VIPER-PATCH(trust-anchors): none requested.
+            trust_anchor_ids: None,
         }
     }
 }
