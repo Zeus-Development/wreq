@@ -990,6 +990,7 @@ mod tests {
             tcp_user_timeout: None,
             tcp_keepalive: TcpKeepaliveOptions::default(),
             socket_bind: SocketBindOptions::default(),
+            // VIPER-PATCH(local-port-bind): no source port choice.
             source_port: None,
         }
     }

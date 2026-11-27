@@ -166,6 +166,7 @@ impl<R, S> HttpConnector<R, S> {
                 tcp_user_timeout: None,
                 tcp_keepalive: TcpKeepaliveOptions::default(),
                 socket_bind: SocketBindOptions::default(),
+                // VIPER-PATCH(local-port-bind): the OS's ports by default.
                 source_port: None,
             }),
             resolver,
