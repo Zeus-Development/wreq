@@ -1145,13 +1145,13 @@ mod tests {
 
         let pool = pool_no_timer::<CanClose, KeyImpl>();
         let key = host_key("foo");
-        let (timeout, now) = (pool.locked().timeout.unwrap(), pool.locked().now());
+        let mut inner = pool.locked();
+        let (timeout, now) = (inner.timeout.unwrap(), inner.now());
         let stale = now.checked_sub(timeout * 2).unwrap();
         let entry = |closed, idle_at| super::Idle {
             idle_at,
             value: CanClose { val: 7, closed },
         };
-        let mut inner = pool.locked();
         let idle = inner.idle.get_or_insert_mut(key.clone(), Vec::new);
         idle.extend([entry(true, now), entry(false, stale)]);
         drop(inner);
