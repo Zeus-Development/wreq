@@ -195,7 +195,11 @@ impl<T: Poolable, K: Key> Pool<T, K> {
         // would leave the checkout waiting where no connection comes.
         let (expiration, now) = (Expiration::new(inner.timeout), inner.now());
         let usable = |e: &Idle<T>| e.value.is_open() && !expiration.expires(e.idle_at, now);
-        let waiter = if inner.idle.peek(&key).is_some_and(|list| list.iter().any(usable)) {
+        let waiter = if inner
+            .idle
+            .peek(&key)
+            .is_some_and(|list| list.iter().any(usable))
+        {
             None
         } else if inner.connecting.contains(&key) {
             let (tx, rx) = oneshot::channel();
@@ -1158,9 +1162,16 @@ mod tests {
         assert!(pool.superseded(key.clone()).is_none(), "connects at once");
         assert!(!pool.locked().waiters.contains_key(&key), "no waiter left");
 
-        pool.locked().idle.peek_mut(&key).unwrap().push(entry(false, now));
+        pool.locked()
+            .idle
+            .peek_mut(&key)
+            .unwrap()
+            .push(entry(false, now));
         let checkout = pool.superseded(key).expect("the open entry");
-        let pooled = checkout.now_or_never().expect("ready").expect("checked out");
+        let pooled = checkout
+            .now_or_never()
+            .expect("ready")
+            .expect("checked out");
         assert!(pooled.is_open());
     }
 }
